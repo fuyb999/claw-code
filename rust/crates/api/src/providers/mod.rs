@@ -122,6 +122,15 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "kimi",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -144,7 +153,10 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi => match *alias {
+                    "kimi" => "kimi-k2.5",
+                    _ => trimmed,
+                },
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -194,6 +206,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
+    // Routes kimi/* and kimi-* model names to DashScope endpoint.
+    if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
     None
 }
 
@@ -229,18 +251,30 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 }
 
 #[must_use]
+pub const fn model_family_identity_for_kind(kind: ProviderKind) -> runtime::ModelFamilyIdentity {
+    match kind {
+        ProviderKind::Anthropic => runtime::ModelFamilyIdentity::Claude,
+        ProviderKind::Xai | ProviderKind::OpenAi => runtime::ModelFamilyIdentity::Generic,
+    }
+}
+
+#[must_use]
+pub fn model_family_identity_for(model: &str) -> runtime::ModelFamilyIdentity {
+    model_family_identity_for_kind(detect_provider_kind(model))
+}
+
+#[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    model_token_limit(model).map_or_else(
-        || {
-            let canonical = resolve_model_alias(model);
-            if canonical.contains("opus") {
-                32_000
-            } else {
-                64_000
-            }
-        },
-        |limit| limit.max_output_tokens,
-    )
+    let canonical = resolve_model_alias(model);
+    let heuristic = if canonical.contains("opus") {
+        32_000
+    } else {
+        64_000
+    };
+
+    model_token_limit(model)
+        .map(|limit| heuristic.min(limit.max_output_tokens))
+        .unwrap_or(heuristic)
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -254,7 +288,8 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    match canonical.as_str() {
+    let base_model = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
+    match base_model {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
@@ -266,6 +301,26 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
+        }),
+        // GPT-4.1 family via the OpenAI API.
+        "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 1_047_576,
+        }),
+        // GPT-5.4 family via the OpenAI API.
+        "gpt-5.4" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "gpt-5.4-mini" | "gpt-5.4-nano" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 400_000,
+        }),
+        // Kimi models via DashScope (Moonshot AI)
+        // Source: https://platform.moonshot.cn/docs/intro
+        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 256_000,
         }),
         _ => None,
     }
@@ -442,8 +497,8 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -503,14 +558,51 @@ mod tests {
     }
 
     #[test]
+    fn maps_provider_kind_to_model_family_identity() {
+        // given: each supported provider kind
+        let anthropic = ProviderKind::Anthropic;
+        let openai = ProviderKind::OpenAi;
+        let xai = ProviderKind::Xai;
+
+        // when: converting provider kinds to prompt model family identities
+        let anthropic_identity = model_family_identity_for_kind(anthropic);
+        let openai_identity = model_family_identity_for_kind(openai);
+        let xai_identity = model_family_identity_for_kind(xai);
+
+        // then: Anthropic stays Claude and OpenAI-compatible providers are generic
+        assert_eq!(anthropic_identity, runtime::ModelFamilyIdentity::Claude);
+        assert_eq!(openai_identity, runtime::ModelFamilyIdentity::Generic);
+        assert_eq!(xai_identity, runtime::ModelFamilyIdentity::Generic);
+    }
+
+    #[test]
+    fn maps_model_name_to_model_family_identity() {
+        // given: Anthropic, OpenAI-compatible, and xAI model names
+        let claude_model = "claude-opus-4-6";
+        let openai_model = "openai/gpt-4.1-mini";
+        let xai_model = "grok-3";
+
+        // when: detecting prompt model family identities from model names
+        let claude_identity = model_family_identity_for(claude_model);
+        let openai_identity = model_family_identity_for(openai_model);
+        let xai_identity = model_family_identity_for(xai_model);
+
+        // then: Anthropic stays Claude and OpenAI-compatible providers are generic
+        assert_eq!(claude_identity, runtime::ModelFamilyIdentity::Claude);
+        assert_eq!(openai_identity, runtime::ModelFamilyIdentity::Generic);
+        assert_eq!(xai_identity, runtime::ModelFamilyIdentity::Generic);
+    }
+
+    #[test]
     fn openai_namespaced_model_routes_to_openai_not_anthropic() {
         // Regression: "openai/gpt-4.1-mini" was misrouted to Anthropic when
         // ANTHROPIC_API_KEY was set because metadata_for_model returned None
         // and detect_provider_kind fell through to auth-sniffer order.
         // The model prefix must win over env-var presence.
-        let kind = super::metadata_for_model("openai/gpt-4.1-mini")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("openai/gpt-4.1-mini"));
+        let kind = super::metadata_for_model("openai/gpt-4.1-mini").map_or_else(
+            || detect_provider_kind("openai/gpt-4.1-mini"),
+            |m| m.provider,
+        );
         assert_eq!(
             kind,
             ProviderKind::OpenAi,
@@ -519,8 +611,7 @@ mod tests {
 
         // Also cover bare gpt- prefix
         let kind2 = super::metadata_for_model("gpt-4o")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
+            .map_or_else(|| detect_provider_kind("gpt-4o"), |m| m.provider);
         assert_eq!(kind2, ProviderKind::OpenAi);
     }
 
@@ -555,9 +646,46 @@ mod tests {
     }
 
     #[test]
+    fn kimi_prefix_routes_to_dashscope() {
+        // Kimi models via DashScope (kimi-k2.5, kimi-k1.5, etc.)
+        let meta = super::metadata_for_model("kimi-k2.5")
+            .expect("kimi-k2.5 must resolve to DashScope metadata");
+        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
+        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
+        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+
+        // With provider prefix
+        let meta2 = super::metadata_for_model("kimi/kimi-k2.5")
+            .expect("kimi/kimi-k2.5 must resolve to DashScope metadata");
+        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
+        assert_eq!(meta2.provider, ProviderKind::OpenAi);
+
+        // Different kimi variants
+        let meta3 = super::metadata_for_model("kimi-k1.5")
+            .expect("kimi-k1.5 must resolve to DashScope metadata");
+        assert_eq!(meta3.auth_env, "DASHSCOPE_API_KEY");
+    }
+
+    #[test]
+    fn kimi_alias_resolves_to_kimi_k2_5() {
+        assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
+        assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("gpt-5.4"), 64_000);
+    }
+
+    #[test]
+    fn caps_default_max_tokens_to_openai_model_limits() {
+        assert_eq!(max_tokens_for_model("gpt-4.1-mini"), 32_768);
+        assert_eq!(max_tokens_for_model("openai/gpt-4.1-mini"), 32_768);
+        assert_eq!(max_tokens_for_model("gpt-5.4"), 64_000);
+        assert_eq!(max_tokens_for_model("openai/gpt-5.4"), 64_000);
     }
 
     #[test]
@@ -624,6 +752,18 @@ mod tests {
                 .context_window_tokens,
             131_072
         );
+        assert_eq!(
+            model_token_limit("openai/gpt-4.1-mini")
+                .expect("openai/gpt-4.1-mini should be registered")
+                .context_window_tokens,
+            1_047_576
+        );
+        assert_eq!(
+            model_token_limit("gpt-5.4")
+                .expect("gpt-5.4 should be registered")
+                .context_window_tokens,
+            1_000_000
+        );
     }
 
     #[test]
@@ -673,6 +813,42 @@ mod tests {
     }
 
     #[test]
+    fn preflight_blocks_oversized_requests_for_gpt_5_4() {
+        let request = MessageRequest {
+            model: "gpt-5.4".to_string(),
+            max_tokens: 64_000,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(3_900_000),
+                }],
+            }],
+            system: Some("Keep the answer short.".to_string()),
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            ..Default::default()
+        };
+
+        let error = preflight_message_request(&request)
+            .expect_err("oversized gpt-5.4 request should be rejected before the provider call");
+
+        match error {
+            ApiError::ContextWindowExceeded {
+                model,
+                requested_output_tokens,
+                context_window_tokens,
+                ..
+            } => {
+                assert_eq!(model, "gpt-5.4");
+                assert_eq!(requested_output_tokens, 64_000);
+                assert_eq!(context_window_tokens, 1_000_000);
+            }
+            other => panic!("expected context-window preflight failure, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn preflight_skips_unknown_models() {
         let request = MessageRequest {
             model: "unknown-model".to_string(),
@@ -692,6 +868,71 @@ mod tests {
 
         preflight_message_request(&request)
             .expect("models without context metadata should skip the guarded preflight");
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_kimi_models() {
+        // kimi-k2.5
+        let k25_limit =
+            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
+        assert_eq!(k25_limit.max_output_tokens, 16_384);
+        assert_eq!(k25_limit.context_window_tokens, 256_000);
+
+        // kimi-k1.5
+        let k15_limit =
+            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
+        assert_eq!(k15_limit.max_output_tokens, 16_384);
+        assert_eq!(k15_limit.context_window_tokens, 256_000);
+    }
+
+    #[test]
+    fn kimi_alias_resolves_to_kimi_k25_token_limits() {
+        // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
+        let alias_limit =
+            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
+        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
+        assert_eq!(
+            alias_limit.max_output_tokens,
+            direct_limit.max_output_tokens
+        );
+        assert_eq!(
+            alias_limit.context_window_tokens,
+            direct_limit.context_window_tokens
+        );
+    }
+
+    #[test]
+    fn preflight_blocks_oversized_requests_for_kimi_models() {
+        let request = MessageRequest {
+            model: "kimi-k2.5".to_string(),
+            max_tokens: 16_384,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(1_000_000), // Large input to exceed context window
+                }],
+            }],
+            system: Some("Keep the answer short.".to_string()),
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            ..Default::default()
+        };
+
+        let error = preflight_message_request(&request)
+            .expect_err("oversized request should be rejected for kimi models");
+
+        match error {
+            ApiError::ContextWindowExceeded {
+                model,
+                context_window_tokens,
+                ..
+            } => {
+                assert_eq!(model, "kimi-k2.5");
+                assert_eq!(context_window_tokens, 256_000);
+            }
+            other => panic!("expected context-window preflight failure, got {other:?}"),
+        }
     }
 
     #[test]

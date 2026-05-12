@@ -135,8 +135,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             let starts_with_tool_result = first_preserved
                 .blocks
                 .first()
-                .map(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .unwrap_or(false);
+                .is_some_and(|b| matches!(b, ContentBlock::ToolResult { .. }));
             if !starts_with_tool_result {
                 break;
             }
@@ -214,6 +213,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
             ContentBlock::Text { .. } => None,
+            ContentBlock::Thinking { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -318,6 +318,9 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
+        ContentBlock::Thinking { thinking, .. } => {
+            format!("thinking ({} chars)", thinking.chars().count())
+        }
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
             tool_name,
@@ -379,6 +382,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
             ContentBlock::Text { text } => text.as_str(),
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
+            ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
         })
         .flat_map(extract_file_candidates)
         .collect::<Vec<_>>();
@@ -401,6 +405,7 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
         ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
+        | ContentBlock::Thinking { .. }
         | ContentBlock::Text { .. } => None,
     })
 }
@@ -451,6 +456,10 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
             ContentBlock::ToolResult {
                 tool_name, output, ..
             } => (tool_name.len() + output.len()) / 4 + 1,
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => thinking.len() / 4 + signature.as_ref().map_or(0, |value| value.len() / 4 + 1),
         })
         .sum()
 }
@@ -741,7 +750,7 @@ mod tests {
 
     /// Regression: compaction must not split an assistant(ToolUse) /
     /// user(ToolResult) pair at the boundary. An orphaned tool-result message
-    /// without the preceding assistant tool_calls causes a 400 on the
+    /// without the preceding assistant `tool_calls` causes a 400 on the
     /// OpenAI-compat path (gaebal-gajae repro 2026-04-09).
     #[test]
     fn compaction_does_not_split_tool_use_tool_result_pair() {
@@ -795,8 +804,7 @@ mod tests {
             let curr_is_tool_result = messages[i]
                 .blocks
                 .first()
-                .map(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .unwrap_or(false);
+                .is_some_and(|b| matches!(b, ContentBlock::ToolResult { .. }));
             if curr_is_tool_result {
                 let prev_has_tool_use = messages[i - 1]
                     .blocks

@@ -9,7 +9,7 @@ const STARTER_CLAW_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# Claw Code local artifacts";
-const GITIGNORE_ENTRIES: [&str; 2] = [".claw/settings.local.json", ".claw/sessions/"];
+const GITIGNORE_ENTRIES: [&str; 3] = [".claw/settings.local.json", ".claw/sessions/", ".clawhip/"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {
@@ -25,6 +25,18 @@ impl InitStatus {
             Self::Created => "created",
             Self::Updated => "updated",
             Self::Skipped => "skipped (already exists)",
+        }
+    }
+
+    /// Machine-stable identifier for structured output (#142).
+    /// Unlike `label()`, this never changes wording: claws can switch on
+    /// these values without brittle substring matching.
+    #[must_use]
+    pub(crate) fn json_tag(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -57,6 +69,36 @@ impl InitReport {
         }
         lines.push("  Next step        Review and tailor the generated guidance".to_string());
         lines.join("\n")
+    }
+
+    /// Summary constant that claws can embed in JSON output without having
+    /// to read it out of the human-formatted `message` string (#142).
+    pub(crate) const NEXT_STEP: &'static str = "Review and tailor the generated guidance";
+
+    /// Artifact names that ended in the given status. Used to build the
+    /// structured `created[]`/`updated[]`/`skipped[]` arrays for #142.
+    #[must_use]
+    pub(crate) fn artifacts_with_status(&self, status: InitStatus) -> Vec<String> {
+        self.artifacts
+            .iter()
+            .filter(|artifact| artifact.status == status)
+            .map(|artifact| artifact.name.to_string())
+            .collect()
+    }
+
+    /// Structured artifact list for JSON output (#142). Each entry carries
+    /// `name` and machine-stable `status` tag.
+    #[must_use]
+    pub(crate) fn artifact_json_entries(&self) -> Vec<serde_json::Value> {
+        self.artifacts
+            .iter()
+            .map(|artifact| {
+                serde_json::json!({
+                    "name": artifact.name,
+                    "status": artifact.status.json_tag(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -333,7 +375,7 @@ fn framework_notes(detection: &RepoDetection) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_repo, render_init_claude_md};
+    use super::{initialize_repo, render_init_claude_md, InitStatus};
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -375,6 +417,7 @@ mod tests {
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".claw/settings.local.json"));
         assert!(gitignore.contains(".claw/sessions/"));
+        assert!(gitignore.contains(".clawhip/"));
         let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
         assert!(claude_md.contains("Languages: Rust."));
         assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
@@ -407,6 +450,64 @@ mod tests {
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert_eq!(gitignore.matches(".claw/settings.local.json").count(), 1);
         assert_eq!(gitignore.matches(".claw/sessions/").count(), 1);
+        assert_eq!(gitignore.matches(".clawhip/").count(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn artifacts_with_status_partitions_fresh_and_idempotent_runs() {
+        // #142: the structured JSON output needs to be able to partition
+        // artifacts into created/updated/skipped without substring matching
+        // the human-formatted `message` string.
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root");
+
+        let fresh = initialize_repo(&root).expect("fresh init should succeed");
+        let created_names = fresh.artifacts_with_status(InitStatus::Created);
+        assert_eq!(
+            created_names,
+            vec![
+                ".claw/".to_string(),
+                ".claw.json".to_string(),
+                ".gitignore".to_string(),
+                "CLAUDE.md".to_string(),
+            ],
+            "fresh init should place all four artifacts in created[]"
+        );
+        assert!(
+            fresh.artifacts_with_status(InitStatus::Skipped).is_empty(),
+            "fresh init should have no skipped artifacts"
+        );
+
+        let second = initialize_repo(&root).expect("second init should succeed");
+        let skipped_names = second.artifacts_with_status(InitStatus::Skipped);
+        assert_eq!(
+            skipped_names,
+            vec![
+                ".claw/".to_string(),
+                ".claw.json".to_string(),
+                ".gitignore".to_string(),
+                "CLAUDE.md".to_string(),
+            ],
+            "idempotent init should place all four artifacts in skipped[]"
+        );
+        assert!(
+            second.artifacts_with_status(InitStatus::Created).is_empty(),
+            "idempotent init should have no created artifacts"
+        );
+
+        // artifact_json_entries() uses the machine-stable `json_tag()` which
+        // never changes wording (unlike `label()` which says "skipped (already exists)").
+        let entries = second.artifact_json_entries();
+        assert_eq!(entries.len(), 4);
+        for entry in &entries {
+            let status = entry.get("status").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(
+                status, "skipped",
+                "machine status tag should be the bare word 'skipped', not label()'s 'skipped (already exists)'"
+            );
+        }
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

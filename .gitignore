@@ -5,6 +5,11 @@ archive/
 .clawd/
 node_modules/
 dist/
+# Claw Code local artifacts
+.claw/settings.local.json
+.claw/sessions/
+.clawhip/
+status-help.txt
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/

@@ -28,6 +28,10 @@ pub struct ApiRequest {
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     TextDelta(String),
     ToolUse {
         id: String,
@@ -292,6 +296,24 @@ where
         }
     }
 
+    /// Run a session health probe to verify the runtime is functional after compaction.
+    /// Returns Ok(()) if healthy, Err if the session appears broken.
+    fn run_session_health_probe(&mut self) -> Result<(), String> {
+        // Check if we have basic session integrity
+        if self.session.messages.is_empty() && self.session.compaction.is_some() {
+            // Freshly compacted with no messages - this is normal
+            return Ok(());
+        }
+
+        // Verify tool executor is responsive with a non-destructive probe
+        // Using glob_search with a pattern that won't match anything
+        let probe_input = r#"{"pattern": "*.health-check-probe-"}"#;
+        match self.tool_executor.execute("glob_search", probe_input) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Tool executor probe failed: {e}")),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -299,6 +321,18 @@ where
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
+
+        // ROADMAP #38: Session-health canary - probe if context was compacted
+        if self.session.compaction.is_some() {
+            if let Err(error) = self.run_session_health_probe() {
+                return Err(RuntimeError::new(format!(
+                    "Session health probe failed after compaction: {error}. \
+                     The session may be in an inconsistent state. \
+                     Consider starting a fresh session with /session new."
+                )));
+            }
+        }
+
         self.record_turn_started(&user_input);
         self.session
             .push_user_text(user_input)
@@ -691,6 +725,16 @@ fn build_assistant_message(
 
     for event in events {
         match event {
+            AssistantEvent::Thinking {
+                thinking,
+                signature,
+            } => {
+                flush_text_block(&mut text, &mut blocks);
+                blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                });
+            }
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
@@ -1582,6 +1626,88 @@ mod tests {
     }
 
     #[test]
+    fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("API should not run when health probe fails");
+            }
+        }
+
+        let mut session = Session::new();
+        session.record_compaction("summarized earlier work", 4);
+        session
+            .push_user_text("previous message")
+            .expect("message should append");
+
+        let tool_executor = StaticToolExecutor::new().register("glob_search", |_input| {
+            Err(ToolError::new("transport unavailable"))
+        });
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("trigger", None)
+            .expect_err("health probe failure should abort the turn");
+        assert!(
+            error
+                .to_string()
+                .contains("Session health probe failed after compaction"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("transport unavailable"),
+            "expected underlying probe error: {error}"
+        );
+    }
+
+    #[test]
+    fn compaction_health_probe_skips_empty_compacted_session() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.record_compaction("fresh summary", 2);
+
+        let tool_executor = StaticToolExecutor::new().register("glob_search", |_input| {
+            Err(ToolError::new(
+                "glob_search should not run for an empty compacted session",
+            ))
+        });
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("empty compacted session should not fail health probe");
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
     fn build_assistant_message_requires_message_stop_event() {
         // given
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];
@@ -1609,6 +1735,47 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream produced no content"));
+    }
+
+    #[test]
+    fn build_assistant_message_places_thinking_block_before_text_and_tool_use() {
+        // given
+        let events = vec![
+            AssistantEvent::Thinking {
+                thinking: "pondering".to_string(),
+                signature: Some("sig".to_string()),
+            },
+            AssistantEvent::TextDelta("hello".to_string()),
+            AssistantEvent::ToolUse {
+                id: "tool-1".to_string(),
+                name: "echo".to_string(),
+                input: "payload".to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ];
+
+        // when
+        let (message, _, _) = build_assistant_message(events)
+            .expect("assistant message should preserve thinking, text, and tool blocks");
+
+        // then
+        assert_eq!(
+            message.blocks,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "pondering".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "echo".to_string(),
+                    input: "payload".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

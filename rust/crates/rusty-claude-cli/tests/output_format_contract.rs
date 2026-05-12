@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use runtime::Session;
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -22,6 +23,42 @@ fn help_emits_json_when_requested() {
 }
 
 #[test]
+fn export_help_emits_bounded_json_when_requested_384() {
+    let root = unique_temp_dir("export-help-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let parsed = assert_json_command(&root, &["export", "--help", "--output-format", "json"]);
+    assert_eq!(parsed["kind"], "help");
+    assert_eq!(parsed["topic"], "export");
+    assert_eq!(parsed["command"], "export");
+    assert_eq!(
+        parsed["usage"],
+        "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+    );
+    assert_eq!(parsed["defaults"]["session"], "latest");
+    assert!(parsed["options"].as_array().expect("options").len() >= 4);
+    assert!(parsed.get("message").is_none());
+}
+
+#[test]
+fn export_help_preserves_plaintext_in_text_mode_384() {
+    let root = unique_temp_dir("export-help-text");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let output = run_claw(&root, &["export", "--help"], &[]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.starts_with("Export\n"));
+    assert!(stdout.contains("Usage            claw export"));
+    serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
+}
+
+#[test]
 fn version_emits_json_when_requested() {
     let root = unique_temp_dir("version-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
@@ -29,6 +66,15 @@ fn version_emits_json_when_requested() {
     let parsed = assert_json_command(&root, &["--output-format", "json", "version"]);
     assert_eq!(parsed["kind"], "version");
     assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+    // Provenance fields must be present for binary identification (#507).
+    assert!(
+        parsed["build_date"].is_string(),
+        "build_date must be a string in version JSON"
+    );
+    assert!(
+        parsed["executable_path"].is_string(),
+        "executable_path must be a string in version JSON so callers can identify which binary is running"
+    );
 }
 
 #[test]
@@ -43,6 +89,24 @@ fn status_and_sandbox_emit_json_when_requested() {
     let sandbox = assert_json_command(&root, &["--output-format", "json", "sandbox"]);
     assert_eq!(sandbox["kind"], "sandbox");
     assert!(sandbox["filesystem_mode"].as_str().is_some());
+}
+
+#[test]
+fn acp_guidance_emits_json_when_requested() {
+    let root = unique_temp_dir("acp-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
+    assert_eq!(acp["kind"], "acp");
+    assert_eq!(acp["status"], "discoverability_only");
+    assert_eq!(acp["supported"], false);
+    assert_eq!(acp["serve_alias_only"], true);
+    assert_eq!(acp["discoverability_tracking"], "ROADMAP #64a");
+    assert_eq!(acp["tracking"], "ROADMAP #76");
+    assert!(acp["message"]
+        .as_str()
+        .expect("acp message")
+        .contains("discoverability alias"));
 }
 
 #[test]
@@ -86,6 +150,18 @@ fn inventory_commands_emit_structured_json_when_requested() {
     let skills = assert_json_command(&root, &["--output-format", "json", "skills"]);
     assert_eq!(skills["kind"], "skills");
     assert_eq!(skills["action"], "list");
+
+    let plugins = assert_json_command(&root, &["--output-format", "json", "plugins"]);
+    assert_eq!(plugins["kind"], "plugin");
+    assert_eq!(plugins["action"], "list");
+    assert!(
+        plugins["reload_runtime"].is_boolean(),
+        "plugins reload_runtime should be a boolean"
+    );
+    assert!(
+        plugins["target"].is_null(),
+        "plugins target should be null when no plugin is targeted"
+    );
 }
 
 #[test]
@@ -173,13 +249,15 @@ fn dump_manifests_and_init_emit_json_when_requested() {
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     let upstream = write_upstream_fixture(&root);
-    let manifests = assert_json_command_with_env(
+    let manifests = assert_json_command(
         &root,
-        &["--output-format", "json", "dump-manifests"],
-        &[(
-            "CLAUDE_CODE_UPSTREAM",
+        &[
+            "--output-format",
+            "json",
+            "dump-manifests",
+            "--manifests-dir",
             upstream.to_str().expect("utf8 upstream"),
-        )],
+        ],
     );
     assert_eq!(manifests["kind"], "dump-manifests");
     assert_eq!(manifests["commands"], 1);
@@ -206,7 +284,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 5);
+    assert_eq!(checks.len(), 6);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -218,7 +296,27 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .collect::<Vec<_>>();
     assert_eq!(
         check_names,
-        vec!["auth", "config", "workspace", "sandbox", "system"]
+        vec![
+            "auth",
+            "config",
+            "install source",
+            "workspace",
+            "sandbox",
+            "system"
+        ]
+    );
+
+    let install_source = checks
+        .iter()
+        .find(|check| check["name"] == "install source")
+        .expect("install source check");
+    assert_eq!(
+        install_source["official_repo"],
+        "https://github.com/ultraworkers/claw-code"
+    );
+    assert_eq!(
+        install_source["deprecated_install"],
+        "cargo install claw-code"
     );
 
     let workspace = checks
@@ -236,12 +334,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(sandbox["enabled"].is_boolean());
     assert!(sandbox["fallback_reason"].is_null() || sandbox["fallback_reason"].is_string());
 
-    let session_path = root.join("session.jsonl");
-    fs::write(
-        &session_path,
-        "{\"type\":\"session_meta\",\"version\":3,\"session_id\":\"resume-json\",\"created_at_ms\":0,\"updated_at_ms\":0}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
-    )
-    .expect("session should write");
+    let session_path = write_session_fixture(&root, "resume-json", Some("hello"));
     let resumed = assert_json_command(
         &root,
         &[
@@ -268,12 +361,7 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&home).expect("home should exist");
 
-    let session_path = root.join("session.jsonl");
-    fs::write(
-        &session_path,
-        "{\"type\":\"session_meta\",\"version\":3,\"session_id\":\"resume-inventory-json\",\"created_at_ms\":0,\"updated_at_ms\":0}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"inventory\"}]}}\n",
-    )
-    .expect("session should write");
+    let session_path = write_session_fixture(&root, "resume-inventory-json", Some("inventory"));
 
     let mcp = assert_json_command_with_env(
         &root,
@@ -317,6 +405,62 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["action"], "list");
     assert!(skills["summary"]["total"].is_number());
     assert!(skills["skills"].is_array());
+
+    let agents = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/agents",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(agents["kind"], "agents");
+    assert_eq!(agents["action"], "list");
+    assert!(
+        agents["agents"].is_array(),
+        "agents field must be a JSON array"
+    );
+    assert!(
+        agents["count"].is_number(),
+        "count must be a number, not a text render"
+    );
+
+    let plugins = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/plugins",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(plugins["kind"], "plugin");
+    assert_eq!(plugins["action"], "list");
+    assert!(
+        plugins["reload_runtime"].is_boolean(),
+        "plugins reload_runtime should be a boolean"
+    );
+    assert!(
+        plugins["target"].is_null(),
+        "plugins target should be null when no plugin is targeted"
+    );
 }
 
 #[test]
@@ -324,12 +468,7 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     let root = unique_temp_dir("resume-version-init-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
-    let session_path = root.join("session.jsonl");
-    fs::write(
-        &session_path,
-        "{\"type\":\"session_meta\",\"version\":3,\"session_id\":\"resume-version-init-json\",\"created_at_ms\":0,\"updated_at_ms\":0}\n",
-    )
-    .expect("session should write");
+    let session_path = write_session_fixture(&root, "resume-version-init-json", None);
 
     let version = assert_json_command(
         &root,
@@ -356,6 +495,44 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     );
     assert_eq!(init["kind"], "init");
     assert!(root.join("CLAUDE.md").exists());
+}
+
+#[test]
+fn config_section_json_emits_section_and_value() {
+    let root = unique_temp_dir("config-section-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    // Without a section: should return base envelope (no section field).
+    let base = assert_json_command(&root, &["--output-format", "json", "config"]);
+    assert_eq!(base["kind"], "config");
+    assert!(base["loaded_files"].is_number());
+    assert!(base["merged_keys"].is_number());
+    assert!(
+        base.get("section").is_none(),
+        "no section field without section arg"
+    );
+
+    // With a known section: should add section + section_value fields.
+    for section in &["model", "env", "hooks", "plugins"] {
+        let result = assert_json_command(&root, &["--output-format", "json", "config", section]);
+        assert_eq!(result["kind"], "config", "section={section}");
+        assert_eq!(
+            result["section"].as_str(),
+            Some(*section),
+            "section field must match requested section, got {result:?}"
+        );
+        assert!(
+            result.get("section_value").is_some(),
+            "section_value field must be present for section={section}"
+        );
+    }
+
+    // With an unsupported section: should return ok:false + error field.
+    let bad = assert_json_command(&root, &["--output-format", "json", "config", "unknown"]);
+    assert_eq!(bad["kind"], "config");
+    assert_eq!(bad["ok"], false);
+    assert!(bad["error"].as_str().is_some());
+    assert!(bad["section"].as_str().is_some());
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
@@ -403,6 +580,24 @@ fn write_upstream_fixture(root: &Path) -> PathBuf {
     )
     .expect("cli fixture should write");
     upstream
+}
+
+fn write_session_fixture(root: &Path, session_id: &str, user_text: Option<&str>) -> PathBuf {
+    let session_path = root.join("session.jsonl");
+    let mut session = Session::new()
+        .with_workspace_root(root.to_path_buf())
+        .with_persistence_path(session_path.clone());
+    session.session_id = session_id.to_string();
+    if let Some(text) = user_text {
+        session
+            .push_user_text(text)
+            .expect("session fixture message should persist");
+    } else {
+        session
+            .save_to_path(&session_path)
+            .expect("session fixture should persist");
+    }
+    session_path
 }
 
 fn write_agent(root: &Path, name: &str, description: &str, model: &str, reasoning: &str) {
