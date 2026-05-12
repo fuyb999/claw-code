@@ -2,6 +2,10 @@ __pycache__/
 archive/
 .omx/
 .clawd-agents/
+.clawd/
+node_modules/
+dist/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
+/release/

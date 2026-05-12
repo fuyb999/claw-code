@@ -1,0 +1,27 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system clawd \
+    && useradd --system --gid clawd --create-home --home-dir /app clawd \
+    && mkdir -p /app/bin /app/data /app/web
+
+WORKDIR /app
+
+COPY app/bin/clawd /app/bin/clawd
+COPY app/web/dist /app/web/dist
+
+RUN chown -R clawd:clawd /app
+
+ENV CLAWD_BIND_ADDR=0.0.0.0:3210
+ENV CLAWD_DATA_DIR=/app/data
+ENV CLAWD_WEB_DIST_DIR=/app/web/dist
+
+EXPOSE 3210
+VOLUME ["/app/data"]
+
+USER clawd
+
+ENTRYPOINT ["/app/bin/clawd"]

@@ -110,10 +110,26 @@ cargo test --workspace
 
 - [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
 - [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
+- [`docs/repository-overview.md`](./docs/repository-overview.md) — full repository architecture and codebase walkthrough
+- [`docs/runtime-call-flow.md`](./docs/runtime-call-flow.md) — end-to-end runtime request path from CLI to tool loop
+- [`docs/module-index.md`](./docs/module-index.md) — file-by-file module index and navigation map
+- [`docs/runtime-subsystems.md`](./docs/runtime-subsystems.md) — runtime crate subsystem responsibilities and boundaries
+- [`docs/testing-map.md`](./docs/testing-map.md) — test layers, CI behavior, and verification guidance
 - [`PARITY.md`](./PARITY.md) — parity status for the Rust port
 - [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
+
+## Web workbench preview
+
+For the chat-first `clawd + web` workbench, use the local preview helper:
+
+```bash
+cd web
+bash scripts/start-dev-preview.sh
+```
+
+The script auto-selects a free port in `4173-4193`, which avoids the usual Vite port collision during UI review.
 
 ## Ecosystem
 

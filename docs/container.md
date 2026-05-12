@@ -5,9 +5,11 @@ This repo already had **container detection** in the Rust runtime before this do
 - `rust/crates/runtime/src/sandbox.rs` detects Docker/Podman/container markers such as `/.dockerenv`, `/run/.containerenv`, matching env vars, and `/proc/1/cgroup` hints.
 - `rust/crates/rusty-claude-cli/src/main.rs` exposes that state through the `claw sandbox` / `cargo run -p rusty-claude-cli -- sandbox` report.
 - `.github/workflows/rust-ci.yml` runs on `ubuntu-latest`, but it does **not** define a Docker or Podman container job.
-- Before this change, the repo did **not** have a checked-in `Dockerfile`, `Containerfile`, or `.devcontainer/` config.
+- Before this document was first added, the repo did **not** have a checked-in `Dockerfile`, `Containerfile`, or `.devcontainer/` config.
 
 This document adds a small checked-in `Containerfile` so Docker and Podman users have one canonical container workflow.
+
+The repository now also has a separate root [`../Dockerfile`](../Dockerfile) for the production `clawd + web` image. This document stays focused on the development/test container workflow based on [`../Containerfile`](../Containerfile).
 
 ## What the checked-in container image is for
 

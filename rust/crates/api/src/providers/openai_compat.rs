@@ -94,6 +94,12 @@ pub struct OpenAiCompatClient {
     max_backoff: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiEndpointKind {
+    ChatCompletions,
+    Responses,
+}
+
 impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
@@ -186,10 +192,32 @@ impl OpenAiCompatClient {
                 });
             }
         }
-        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
-        })?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = match endpoint_kind(&self.base_url) {
+            OpenAiEndpointKind::ChatCompletions => {
+                let payload =
+                    serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.config.provider_name,
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_response(&request.model, payload)?
+            }
+            OpenAiEndpointKind::Responses => {
+                let payload =
+                    serde_json::from_str::<ResponsesApiResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.config.provider_name,
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_responses_api_response(&request.model, payload)?
+            }
+        };
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -200,18 +228,22 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        if endpoint_kind(&self.base_url) == OpenAiEndpointKind::Responses {
+            let response = self.send_message(request).await?;
+            return Ok(MessageStream::synthetic(response));
+        }
         preflight_message_request(request)?;
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
-        Ok(MessageStream {
-            request_id: request_id_from_headers(response.headers()),
+        Ok(MessageStream::http(
+            request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
-            pending: VecDeque::new(),
-            done: false,
-            state: StreamState::new(request.model.clone()),
-        })
+            OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
+            VecDeque::new(),
+            false,
+            StreamState::new(request.model.clone()),
+        ))
     }
 
     async fn send_with_retry(
@@ -249,12 +281,21 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = chat_completions_endpoint(&self.base_url);
+        let (request_url, payload) = match endpoint_kind(&self.base_url) {
+            OpenAiEndpointKind::ChatCompletions => (
+                chat_completions_endpoint(&self.base_url),
+                build_chat_completion_request(request, self.config()),
+            ),
+            OpenAiEndpointKind::Responses => (
+                responses_endpoint(&self.base_url),
+                build_responses_api_request(request),
+            ),
+        };
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&payload)
             .send()
             .await
             .map_err(ApiError::from)
@@ -340,44 +381,158 @@ impl Provider for OpenAiCompatClient {
 
 #[derive(Debug)]
 pub struct MessageStream {
-    request_id: Option<String>,
-    response: reqwest::Response,
-    parser: OpenAiSseParser,
-    pending: VecDeque<StreamEvent>,
-    done: bool,
-    state: StreamState,
+    inner: MessageStreamInner,
+}
+
+#[derive(Debug)]
+enum MessageStreamInner {
+    Http {
+        request_id: Option<String>,
+        response: reqwest::Response,
+        parser: OpenAiSseParser,
+        pending: VecDeque<StreamEvent>,
+        done: bool,
+        state: StreamState,
+    },
+    Synthetic {
+        request_id: Option<String>,
+        pending: VecDeque<StreamEvent>,
+    },
 }
 
 impl MessageStream {
+    fn http(
+        request_id: Option<String>,
+        response: reqwest::Response,
+        parser: OpenAiSseParser,
+        pending: VecDeque<StreamEvent>,
+        done: bool,
+        state: StreamState,
+    ) -> Self {
+        Self {
+            inner: MessageStreamInner::Http {
+                request_id,
+                response,
+                parser,
+                pending,
+                done,
+                state,
+            },
+        }
+    }
+
+    fn synthetic(response: MessageResponse) -> Self {
+        let request_id = response.request_id.clone();
+        let mut pending = VecDeque::new();
+        pending.push_back(StreamEvent::MessageStart(MessageStartEvent {
+            message: MessageResponse {
+                id: response.id.clone(),
+                kind: response.kind.clone(),
+                role: response.role.clone(),
+                content: Vec::new(),
+                model: response.model.clone(),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: Usage::default(),
+                request_id: response.request_id.clone(),
+            },
+        }));
+        for (index, block) in response.content.iter().enumerate() {
+            match block {
+                OutputContentBlock::Text { text } => {
+                    pending.push_back(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: index as u32,
+                        content_block: OutputContentBlock::Text {
+                            text: String::new(),
+                        },
+                    }));
+                    if !text.is_empty() {
+                        pending.push_back(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                            index: index as u32,
+                            delta: ContentBlockDelta::TextDelta { text: text.clone() },
+                        }));
+                    }
+                    pending.push_back(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: index as u32,
+                    }));
+                }
+                OutputContentBlock::ToolUse { id, name, input } => {
+                    pending.push_back(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: index as u32,
+                        content_block: OutputContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: json!({}),
+                        },
+                    }));
+                    pending.push_back(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                        index: index as u32,
+                        delta: ContentBlockDelta::InputJsonDelta {
+                            partial_json: input.to_string(),
+                        },
+                    }));
+                    pending.push_back(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: index as u32,
+                    }));
+                }
+                OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+            }
+        }
+        pending.push_back(StreamEvent::MessageDelta(MessageDeltaEvent {
+            delta: MessageDelta {
+                stop_reason: response.stop_reason.clone().or(Some("end_turn".to_string())),
+                stop_sequence: response.stop_sequence.clone(),
+            },
+            usage: response.usage.clone(),
+        }));
+        pending.push_back(StreamEvent::MessageStop(MessageStopEvent {}));
+        Self {
+            inner: MessageStreamInner::Synthetic { request_id, pending },
+        }
+    }
+
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
-        self.request_id.as_deref()
+        match &self.inner {
+            MessageStreamInner::Http { request_id, .. }
+            | MessageStreamInner::Synthetic { request_id, .. } => request_id.as_deref(),
+        }
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(Some(event));
-            }
-
-            if self.done {
-                self.pending.extend(self.state.finish()?);
-                if let Some(event) = self.pending.pop_front() {
+        match &mut self.inner {
+            MessageStreamInner::Synthetic { pending, .. } => Ok(pending.pop_front()),
+            MessageStreamInner::Http {
+                response,
+                parser,
+                pending,
+                done,
+                state,
+                ..
+            } => loop {
+                if let Some(event) = pending.pop_front() {
                     return Ok(Some(event));
                 }
-                return Ok(None);
-            }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    for parsed in self.parser.push(&chunk)? {
-                        self.pending.extend(self.state.ingest_chunk(parsed)?);
+                if *done {
+                    pending.extend(state.finish()?);
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some(event));
+                    }
+                    return Ok(None);
+                }
+
+                match response.chunk().await? {
+                    Some(chunk) => {
+                        for parsed in parser.push(&chunk)? {
+                            pending.extend(state.ingest_chunk(parsed)?);
+                        }
+                    }
+                    None => {
+                        *done = true;
                     }
                 }
-                None => {
-                    self.done = true;
-                }
-            }
+            },
         }
     }
 }
@@ -686,6 +841,49 @@ struct ResponseToolFunction {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResponsesApiResponse {
+    id: String,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Vec<ResponsesContentItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesContentItem {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: u32,
@@ -868,6 +1066,40 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     payload
 }
 
+fn build_responses_api_request(request: &MessageRequest) -> Value {
+    let wire_model = strip_routing_prefix(&request.model);
+    let mut payload = json!({
+        "model": wire_model,
+        "input": translate_messages_to_responses_input(&request.messages),
+    });
+
+    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
+        payload["instructions"] = json!(system);
+    }
+    if request.max_tokens > 0 {
+        payload["max_output_tokens"] = json!(request.max_tokens);
+    }
+    if let Some(tools) = &request.tools {
+        payload["tools"] = Value::Array(
+            tools.iter()
+                .map(openai_responses_tool_definition)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        payload["tool_choice"] = openai_responses_tool_choice(tool_choice);
+    }
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["stop"] = json!(stop);
+        }
+    }
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning"] = json!({ "effort": effort });
+    }
+    payload
+}
+
 fn translate_message(message: &InputMessage) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
@@ -924,6 +1156,68 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             })
             .collect(),
     }
+}
+
+fn translate_messages_to_responses_input(messages: &[InputMessage]) -> Vec<Value> {
+    let mut translated = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "assistant" => {
+                let mut content = Vec::new();
+                for block in &message.content {
+                    match block {
+                        InputContentBlock::Text { text } => content.push(json!({
+                            "type": "output_text",
+                            "text": text,
+                        })),
+                        InputContentBlock::ToolUse { id, name, input } => translated.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": input.to_string(),
+                        })),
+                        InputContentBlock::ToolResult { .. } => {}
+                    }
+                }
+                if !content.is_empty() {
+                    translated.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": content,
+                    }));
+                }
+            }
+            _ => {
+                let mut content = Vec::new();
+                for block in &message.content {
+                    match block {
+                        InputContentBlock::Text { text } => content.push(json!({
+                            "type": "input_text",
+                            "text": text,
+                        })),
+                        InputContentBlock::ToolResult {
+                            tool_use_id,
+                            content: tool_content,
+                            ..
+                        } => translated.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": flatten_tool_result_content(tool_content),
+                        })),
+                        InputContentBlock::ToolUse { .. } => {}
+                    }
+                }
+                if !content.is_empty() {
+                    translated.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+            }
+        }
+    }
+    translated
 }
 
 /// Remove `role:"tool"` messages from `messages` that have no valid paired
@@ -1049,6 +1343,17 @@ fn openai_tool_definition(tool: &ToolDefinition) -> Value {
     })
 }
 
+fn openai_responses_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": parameters,
+    })
+}
+
 fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
     match tool_choice {
         ToolChoice::Auto => Value::String("auto".to_string()),
@@ -1056,6 +1361,17 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
         ToolChoice::Tool { name } => json!({
             "type": "function",
             "function": { "name": name },
+        }),
+    }
+}
+
+fn openai_responses_tool_choice(tool_choice: &ToolChoice) -> Value {
+    match tool_choice {
+        ToolChoice::Auto => Value::String("auto".to_string()),
+        ToolChoice::Any => Value::String("required".to_string()),
+        ToolChoice::Tool { name } => json!({
+            "type": "function",
+            "name": name,
         }),
     }
 }
@@ -1108,6 +1424,62 @@ fn normalize_response(
                 .usage
                 .as_ref()
                 .map_or(0, |usage| usage.completion_tokens),
+        },
+        request_id: None,
+    })
+}
+
+fn normalize_responses_api_response(
+    model: &str,
+    response: ResponsesApiResponse,
+) -> Result<MessageResponse, ApiError> {
+    let mut content = Vec::new();
+    let mut role = "assistant".to_string();
+    for item in response.output {
+        match item.kind.as_str() {
+            "message" => {
+                if let Some(item_role) = item.role {
+                    role = item_role;
+                }
+                for block in item.content {
+                    if block.kind == "output_text" {
+                        if let Some(text) = block.text.filter(|value| !value.is_empty()) {
+                            content.push(OutputContentBlock::Text { text });
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                let name = item.name.ok_or(ApiError::InvalidSseFrame(
+                    "responses output missing function name",
+                ))?;
+                let id = item
+                    .call_id
+                    .or(item.id)
+                    .unwrap_or_else(|| format!("tool_call_{}", content.len()));
+                let arguments = item.arguments.unwrap_or_else(|| "{}".to_string());
+                content.push(OutputContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: parse_tool_arguments(&arguments),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(MessageResponse {
+        id: response.id,
+        kind: "message".to_string(),
+        role,
+        content,
+        model: model.to_string(),
+        stop_reason: Some("end_turn".to_string()),
+        stop_sequence: None,
+        usage: Usage {
+            input_tokens: response.usage.as_ref().map_or(0, |usage| usage.input_tokens),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: response.usage.as_ref().map_or(0, |usage| usage.output_tokens),
         },
         request_id: None,
     })
@@ -1217,11 +1589,46 @@ pub fn read_base_url(config: OpenAiCompatConfig) -> String {
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
+    let trimmed = normalized_openai_base_url(base_url);
     if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
+        trimmed
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+fn responses_endpoint(base_url: &str) -> String {
+    let trimmed = normalized_openai_base_url(base_url);
+    if trimmed.ends_with("/responses") {
+        trimmed
+    } else {
+        format!("{trimmed}/responses")
+    }
+}
+
+fn normalized_openai_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/').to_string();
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed
+            .trim_end_matches("/chat/completions")
+            .trim_end_matches('/')
+            .to_string();
+    }
+    if trimmed.ends_with("/responses") {
+        return trimmed;
+    }
+    trimmed
+}
+
+fn endpoint_kind(base_url: &str) -> OpenAiEndpointKind {
+    if base_url
+        .trim()
+        .trim_end_matches('/')
+        .ends_with("/responses")
+    {
+        OpenAiEndpointKind::Responses
+    } else {
+        OpenAiEndpointKind::ChatCompletions
     }
 }
 
@@ -1288,9 +1695,10 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        build_chat_completion_request, build_responses_api_request, chat_completions_endpoint,
+        endpoint_kind, is_reasoning_model, normalize_finish_reason, openai_tool_choice,
+        parse_tool_arguments, responses_endpoint, OpenAiCompatClient, OpenAiCompatConfig,
+        OpenAiEndpointKind,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1498,6 +1906,60 @@ mod tests {
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
         );
+        assert_eq!(
+            chat_completions_endpoint("https://api-vip.codex-for.me/v1/responses"),
+            "https://api-vip.codex-for.me/v1/responses/chat/completions"
+        );
+        assert_eq!(
+            responses_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            responses_endpoint("https://api-vip.codex-for.me/v1/responses"),
+            "https://api-vip.codex-for.me/v1/responses"
+        );
+        assert_eq!(
+            endpoint_kind("https://api-vip.codex-for.me/v1/responses"),
+            OpenAiEndpointKind::Responses
+        );
+    }
+
+    #[test]
+    fn responses_request_translation_uses_input_and_reasoning_shape() {
+        let payload = build_responses_api_request(&MessageRequest {
+            model: "gpt-5.4".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "weather".to_string(),
+                        input: json!({"city": "Paris"}),
+                    }],
+                },
+                InputMessage::user_tool_result("call_1", "{\"temp\":20}", false),
+            ],
+            system: Some("be concise".to_string()),
+            tools: Some(vec![ToolDefinition {
+                name: "weather".to_string(),
+                description: Some("Get weather".to_string()),
+                input_schema: json!({"type":"object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(payload["model"], json!("gpt-5.4"));
+        assert_eq!(payload["instructions"], json!("be concise"));
+        assert_eq!(payload["max_output_tokens"], json!(128));
+        assert_eq!(payload["input"][0]["type"], json!("message"));
+        assert_eq!(payload["input"][0]["content"][0]["type"], json!("input_text"));
+        assert_eq!(payload["input"][1]["type"], json!("function_call"));
+        assert_eq!(payload["input"][2]["type"], json!("function_call_output"));
+        assert_eq!(payload["tools"][0]["type"], json!("function"));
+        assert_eq!(payload["reasoning"]["effort"], json!("high"));
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
