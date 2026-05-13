@@ -143,4 +143,49 @@ describe("InspirationMode", () => {
     expect(html).not.toContain("index_name");
     expect(html).not.toContain("internal-es");
   });
+
+  it("shows low-frequency settings as summaries rather than an admin console", () => {
+    const html = renderToStaticMarkup(
+      <InspirationMode
+        auth={{ userId: "test-user" }}
+        authSession={{
+          auth_mode: "dev_user_header",
+          tenant_id: null,
+          user_id: "test-user",
+          api_key_id: null,
+          api_key_prefix: null,
+          display_name: null,
+        }}
+        config={{
+          database_backend: "sqlite",
+          database_schema_version: 1,
+          default_model: "gpt-test",
+          default_permission_mode: "read-only",
+          run_timeout_secs: null,
+          max_threads_per_user: null,
+          max_threads_per_tenant: null,
+          max_concurrent_runs_global: null,
+          max_concurrent_runs_per_tenant: null,
+          max_concurrent_runs_per_user: null,
+          max_mutation_requests_per_minute_global: null,
+          max_mutation_requests_per_minute_per_tenant: null,
+          max_mutation_requests_per_minute_per_user: null,
+          api_key_auth_enabled: true,
+          dev_user_header_auth_enabled: true,
+        }}
+        onBack={() => {}}
+        onCloseManagement={() => {}}
+        onCloseModelSettings={() => {}}
+        onSignOut={() => {}}
+        managementOpen={true}
+        modelSettingsOpen={false}
+      />,
+    );
+
+    expect(html).toContain("工作区设置");
+    expect(html).toContain("资料与专家摘要");
+    expect(html).not.toContain("管理抽屉");
+    expect(html).not.toContain("ES 连接");
+    expect(html).not.toContain("endpoint");
+  });
 });

@@ -4,7 +4,7 @@ import { act } from "react";
 
 import { TimelineEventCard } from "./TimelineEventCard";
 
-globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("TimelineEventCard", () => {
   it("forwards artifact and evidence references through click handlers", () => {
