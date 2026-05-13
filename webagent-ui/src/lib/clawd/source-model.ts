@@ -55,7 +55,8 @@ function kindLabel(kind: DataSourceKind): string {
 }
 
 function isSearchable(kind: DataSourceKind, status: string | null): boolean {
-  if (status && ["failed", "error", "disabled"].includes(status.toLowerCase())) {
+  const normalizedStatus = status?.toLowerCase() ?? null;
+  if (normalizedStatus !== "ready") {
     return false;
   }
   return kind === "upload" || kind === "es" || kind === "web" || kind === "db";
@@ -95,8 +96,15 @@ export function buildSourceRailModel({
         }
       : null,
     personalUploads: railSources.filter((source) => source.kind === "upload"),
-    favorites: railSources.filter((source) => source.kind === "notion" || source.kind === "confluence"),
-    platformSources: railSources.filter((source) => source.kind === "es" || source.kind === "db" || source.kind === "web"),
+    favorites: [],
+    platformSources: railSources.filter(
+      (source) =>
+        source.kind === "es" ||
+        source.kind === "db" ||
+        source.kind === "web" ||
+        source.kind === "notion" ||
+        source.kind === "confluence",
+    ),
   };
 }
 

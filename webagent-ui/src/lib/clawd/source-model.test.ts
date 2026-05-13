@@ -95,6 +95,35 @@ describe("source-model", () => {
     expect(JSON.stringify(model)).not.toContain("api_key");
   });
 
+  it("keeps favorites empty without an explicit favorite signal and retains external sources in platform sources", () => {
+    const model = buildSourceRailModel({
+      dataSources: [
+        source({
+          id: "notion-1",
+          knowledge_base_id: "kb-platform",
+          name: "产品文档",
+          kind: "notion",
+          status: "ready",
+        }),
+        source({
+          id: "conf-1",
+          knowledge_base_id: "kb-platform",
+          name: "运行手册",
+          kind: "confluence",
+          status: "ready",
+        }),
+      ],
+      knowledgeBases: [kb({ id: "kb-platform", name: "平台知识", data_source_count: 2 })],
+      selectedKnowledgeBaseId: "kb-platform",
+    });
+
+    expect(model.favorites).toEqual([]);
+    expect(model.platformSources).toMatchObject([
+      { id: "notion-1", kind: "notion", searchable: false },
+      { id: "conf-1", kind: "confluence", searchable: false },
+    ]);
+  });
+
   it("presents status in user language", () => {
     expect(presentSourceStatus({ status: "ready", searchable: true } as SourceRailDataSource)).toBe("可检索");
     expect(presentSourceStatus({ status: "syncing", searchable: false } as SourceRailDataSource)).toBe("同步中");
