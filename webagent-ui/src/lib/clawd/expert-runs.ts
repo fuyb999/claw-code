@@ -33,6 +33,7 @@ export function buildExpertRunRequest(
 ): CreateExpertPanelRunRequest {
   const question = options.question?.trim() || "";
   const sourceMessageId = options.sourceMessageId?.trim() || "";
+  const knowledgeBaseId = options.knowledgeBaseId?.trim() || "";
 
   if (!options.experts.length) {
     throw new Error("请先选择至少一位专家。");
@@ -48,7 +49,7 @@ export function buildExpertRunRequest(
 
   return {
     ...(question ? { question } : { source_message_id: sourceMessageId }),
-    ...(options.knowledgeBaseId ? { knowledge_base_id: options.knowledgeBaseId } : {}),
+    ...(knowledgeBaseId ? { knowledge_base_id: knowledgeBaseId } : {}),
     ...(options.autoRetrieval !== undefined ? { auto_retrieval: options.autoRetrieval } : {}),
     experts: options.experts.map((expert) => ({
       skill: expert.skill,

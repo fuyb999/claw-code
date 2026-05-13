@@ -53,6 +53,35 @@ describe("buildExpertRunRequest", () => {
     });
   });
 
+  it("rejects requests that provide both question and source message", () => {
+    expect(() =>
+      buildExpertRunRequest({
+        question: "分析中美 AI 竞争",
+        sourceMessageId: "thread-1-message-2",
+        experts: [expert("mearsheimer", "米尔斯海默")],
+        retryCount: 1,
+        concurrencyLimit: 3,
+      }),
+    ).toThrow("问题和来源消息只能二选一");
+  });
+
+  it("omits a whitespace-only knowledge base id from the payload", () => {
+    expect(
+      buildExpertRunRequest({
+        question: "分析中美 AI 竞争",
+        knowledgeBaseId: "   ",
+        experts: [expert("mearsheimer", "米尔斯海默")],
+        retryCount: 1,
+        concurrencyLimit: 3,
+      }),
+    ).toEqual({
+      question: "分析中美 AI 竞争",
+      experts: [expert("mearsheimer", "米尔斯海默")],
+      retry_count: 1,
+      concurrency_limit: 3,
+    });
+  });
+
   it("rejects empty experts or missing question/source message", () => {
     expect(() =>
       buildExpertRunRequest({
