@@ -245,7 +245,7 @@ describe("timeline-events", () => {
     ]);
   });
 
-  it("does not duplicate equivalent execution context from message metadata and audit records", () => {
+  it("does not duplicate equivalent execution context from message metadata and audit records at the same timestamp", () => {
     const events = buildTimelineEvents(
       thread({
         updated_at_ms: 20,
@@ -286,5 +286,58 @@ describe("timeline-events", () => {
     ]);
     expect(events.filter((event) => event.kind === "execution_scope")).toHaveLength(1);
     expect(events.filter((event) => event.kind === "retrieval_policy")).toHaveLength(1);
+  });
+
+  it("keeps equivalent execution context from audit records when the timestamp differs", () => {
+    const events = buildTimelineEvents(
+      thread({
+        updated_at_ms: 20,
+        messages: [
+          messageWithMetadata({
+            id: "m-user",
+            role: "user",
+            blocks: [{ type: "text", text: "继续当前分析" }],
+            metadata: {
+              effective_execution_context: {
+                knowledge_base_name: "项目知识库",
+                auto_retrieval: true,
+              },
+            },
+          }),
+        ],
+        audit_records: [
+          {
+            id: "audit-ctx",
+            run_id: 7,
+            kind: "thread_run_context",
+            created_at_ms: 21,
+            payload: {
+              effective_execution_context: {
+                knowledge_base_name: "项目知识库",
+                auto_retrieval: true,
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+      "retrieval_policy",
+      "execution_scope",
+      "retrieval_policy",
+    ]);
+    expect(events.filter((event) => event.kind === "execution_scope")).toHaveLength(2);
+    expect(events.filter((event) => event.kind === "retrieval_policy")).toHaveLength(2);
+    expect(events.filter((event) => event.kind === "execution_scope").map((event) => event.atMs)).toEqual([
+      20,
+      21,
+    ]);
+    expect(events.filter((event) => event.kind === "retrieval_policy").map((event) => event.atMs)).toEqual([
+      20,
+      21,
+    ]);
   });
 });

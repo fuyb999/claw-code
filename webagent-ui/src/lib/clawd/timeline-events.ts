@@ -251,7 +251,7 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
     return [];
   }
 
-  const messageContextSignatures = new Set(
+  const messageContextSignaturesAtThreadTimestamp = new Set(
     thread.messages
       .map(executionContextFromMessage)
       .map(executionContextSignature)
@@ -325,7 +325,11 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
     const context = executionContextFromAudit(audit);
     const signature = executionContextSignature(context);
 
-    if (signature && messageContextSignatures.has(signature)) {
+    if (
+      signature &&
+      audit.created_at_ms === thread.updated_at_ms &&
+      messageContextSignaturesAtThreadTimestamp.has(signature)
+    ) {
       return [];
     }
 
