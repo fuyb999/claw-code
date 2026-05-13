@@ -157,6 +157,7 @@ export function InspirationMode({
   const [selectedExpertIds, setSelectedExpertIds] = useState<string[]>([]);
   const [retryCount, setRetryCount] = useState(1);
   const [concurrencyLimit, setConcurrencyLimit] = useState(3);
+  const [autoRetrieval, setAutoRetrieval] = useState(true);
   const [activeReferenceTarget, setActiveReferenceTarget] = useState<TimelineReferenceTarget | null>(null);
   const [browserModelConfig, setBrowserModelConfig] = useState<BrowserModelConfig>({
     baseUrl: "",
@@ -386,6 +387,7 @@ export function InspirationMode({
         />
 
         <ExpertPanel
+          autoRetrieval={autoRetrieval}
           concurrencyLimit={concurrencyLimit}
           discussionMode={discussionMode}
           experts={experts}
@@ -399,6 +401,7 @@ export function InspirationMode({
                 ? expertRun.error
                 : null
           }
+          onAutoRetrievalChange={setAutoRetrieval}
           onConcurrencyLimitChange={(value) => setConcurrencyLimit(Math.min(8, Math.max(1, value || 1)))}
           onModeChange={setDiscussionMode}
           onRetryCountChange={(value) => setRetryCount(Math.min(3, Math.max(0, value || 0)))}
