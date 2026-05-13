@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { buildTimelineEvents } from "./timeline-events";
-import type { MessageSnapshot, ThreadSnapshot } from "./types";
+import type {
+  MessageExecutionContextMetadata,
+  MessageSnapshot,
+  ThreadSnapshot,
+} from "./types";
 
 function thread(overrides: Partial<ThreadSnapshot>): ThreadSnapshot {
   return {
@@ -29,8 +33,8 @@ function thread(overrides: Partial<ThreadSnapshot>): ThreadSnapshot {
 }
 
 function messageWithMetadata(
-  message: MessageSnapshot & { metadata: Record<string, unknown> | null },
-): MessageSnapshot & { metadata: Record<string, unknown> | null } {
+  message: MessageSnapshot & { metadata: MessageExecutionContextMetadata | null },
+): MessageSnapshot & { metadata: MessageExecutionContextMetadata | null } {
   return message;
 }
 

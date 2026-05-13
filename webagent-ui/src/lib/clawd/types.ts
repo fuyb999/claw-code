@@ -15,11 +15,23 @@ export type MessageBlock =
       is_error: boolean;
     };
 
+export interface ExecutionContextPayload {
+  knowledge_base_name?: string | null;
+  knowledgeBaseName?: string | null;
+  auto_retrieval?: boolean | null;
+  autoRetrieval?: boolean | null;
+}
+
+export interface MessageExecutionContextMetadata extends ExecutionContextPayload {
+  effective_execution_context?: ExecutionContextPayload | null;
+  execution_context?: ExecutionContextPayload | null;
+}
+
 export interface MessageSnapshot {
   id: string;
   role: "system" | "user" | "assistant" | "tool";
   blocks: MessageBlock[];
-  metadata?: Record<string, unknown> | null;
+  metadata?: MessageExecutionContextMetadata | null;
 }
 
 export interface MemoryNote {

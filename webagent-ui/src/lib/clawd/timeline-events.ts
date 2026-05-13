@@ -7,7 +7,9 @@ import { presentArtifactKind } from "./presentation";
 import type {
   ArtifactRecord,
   AuditRecord,
+  ExecutionContextPayload,
   MessageBlock,
+  MessageExecutionContextMetadata,
   ThreadSnapshot,
 } from "./types";
 
@@ -68,11 +70,11 @@ function booleanValue(record: Record<string, unknown> | null, keys: readonly str
 }
 
 function executionContextFromValue(value: unknown): ExecutionContext | null {
-  const record = asRecord(value);
-  if (!record) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
 
+  const record = value as ExecutionContextPayload & Record<string, unknown>;
   const knowledgeBaseName = firstNonEmptyString(record, [
     "knowledge_base_name",
     "knowledgeBaseName",
@@ -93,14 +95,14 @@ function executionContextFromValue(value: unknown): ExecutionContext | null {
 }
 
 function executionContextFromMessage(message: ThreadSnapshot["messages"][number]): ExecutionContext | null {
-  const metadata = asRecord(message.metadata);
+  const metadata = message.metadata;
   if (!metadata) {
     return null;
   }
 
   return (
-    executionContextFromValue(metadata.effective_execution_context) ??
-    executionContextFromValue(metadata.execution_context) ??
+    executionContextFromValue(metadata.effective_execution_context as MessageExecutionContextMetadata | null) ??
+    executionContextFromValue(metadata.execution_context as MessageExecutionContextMetadata | null) ??
     executionContextFromValue(metadata)
   );
 }
