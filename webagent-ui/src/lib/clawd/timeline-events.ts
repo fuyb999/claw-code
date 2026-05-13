@@ -125,16 +125,14 @@ function timelineEventsFromExecutionContext(
 
   const events: TimelineEvent[] = [];
 
-  if (context.knowledgeBaseName) {
-    events.push({
-      id: `${idPrefix}:execution_scope`,
-      kind: "execution_scope",
-      title: "本次使用资料范围",
-      subtitle: context.knowledgeBaseName,
-      atMs,
-      reference: null,
-    });
-  }
+  events.push({
+    id: `${idPrefix}:execution_scope`,
+    kind: "execution_scope",
+    title: "本次使用资料范围",
+    subtitle: context.knowledgeBaseName ?? "当前资料范围",
+    atMs,
+    reference: null,
+  });
 
   if (context.autoRetrieval !== null) {
     events.push({

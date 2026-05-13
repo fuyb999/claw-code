@@ -174,6 +174,37 @@ describe("timeline-events", () => {
     });
   });
 
+  it("derives execution scope with fallback subtitle when effective execution context has no KB name", () => {
+    const events = buildTimelineEvents(
+      thread({
+        messages: [
+          messageWithMetadata(
+            {
+              id: "m-user",
+              role: "user",
+              blocks: [{ type: "text", text: "请继续分析" }],
+            },
+            {
+              effective_execution_context: {
+                auto_retrieval: true,
+              },
+            },
+          ),
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+      "retrieval_policy",
+    ]);
+    expect(events.find((event) => event.kind === "execution_scope")).toMatchObject({
+      title: "本次使用资料范围",
+      subtitle: "当前资料范围",
+    });
+  });
+
   it("derives execution scope and retrieval policy from audit payload when message metadata is absent", () => {
     const events = buildTimelineEvents(
       thread({
