@@ -7580,18 +7580,22 @@ async fn create_expert_panel_run(
             )
         })?
     };
-    resolve_override_knowledge_base_for_run(
+    let execution_context = resolve_run_execution_context(
         &state.store,
         &thread_record,
-        Some(&RunExecutionContext {
-            knowledge_base_id: request.knowledge_base_id.clone(),
-            knowledge_base_name: None,
-            auto_retrieval: request.auto_retrieval,
-        }),
+        &RunRequest {
+            kind: RunKind::ExpertPanel,
+            prompt: prompt.clone(),
+            expert_panel: None,
+            expert_run: None,
+            execution_context: Some(RunExecutionContext {
+                knowledge_base_id: request.knowledge_base_id.clone(),
+                knowledge_base_name: None,
+                auto_retrieval: request.auto_retrieval,
+            }),
+        },
     )?;
     let response = expert_run_initial_response(&thread_id, &run_id, &request);
-    persist_expert_run_state(&state, &thread, &response)
-        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     start_run(
         state.clone(),
         thread.clone(),
@@ -7608,13 +7612,11 @@ async fn create_expert_panel_run(
                 retry_count: request.retry_count.unwrap_or(1),
                 concurrency_limit: request.concurrency_limit.unwrap_or(3),
             }),
-            execution_context: Some(RunExecutionContext {
-                knowledge_base_id: request.knowledge_base_id.clone(),
-                knowledge_base_name: None,
-                auto_retrieval: request.auto_retrieval,
-            }),
+            execution_context,
         },
     )?;
+    persist_expert_run_state(&state, &thread, &response)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
     Ok(Json(response))
 }
@@ -8276,6 +8278,7 @@ fn execute_single_expert_attempt(
     base_record: ThreadRecord,
     base_session: Session,
     abort_signal: HookAbortSignal,
+    execution_context: Option<RunExecutionContext>,
 ) -> Result<ExpertExecutionOutput, ExpertExecutionFailure> {
     let start_index = base_session.messages.len();
     let permission_mode = parse_permission_mode(&base_record.permission_mode)
@@ -8312,7 +8315,7 @@ fn execute_single_expert_attempt(
             retry_count: 0,
             concurrency_limit: 1,
         }),
-        execution_context: None,
+        execution_context,
     };
     let system_prompt = build_system_prompt(
         &state.config,
@@ -8390,6 +8393,7 @@ fn execute_expert_with_retries(
     base_record: ThreadRecord,
     base_session: Session,
     abort_signal: HookAbortSignal,
+    execution_context: Option<RunExecutionContext>,
 ) -> Result<ExpertExecutionOutput, ExpertExecutionFailure> {
     let max_attempts = retry_count.saturating_add(1);
     let mut last_failure: Option<ExpertExecutionFailure> = None;
@@ -8417,6 +8421,7 @@ fn execute_expert_with_retries(
             base_record.clone(),
             base_session.clone(),
             abort_signal.clone(),
+            execution_context.clone(),
         );
         match result {
             Ok(output) => return Ok(output),
@@ -8441,6 +8446,7 @@ fn execute_experts_bounded(
     base_record: ThreadRecord,
     base_session: Session,
     abort_signal: HookAbortSignal,
+    execution_context: Option<RunExecutionContext>,
 ) -> (Vec<ExpertExecutionOutput>, Vec<ExpertExecutionFailure>) {
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut pending = std::collections::VecDeque::from(experts);
@@ -8463,6 +8469,7 @@ fn execute_experts_bounded(
             let base_record = base_record.clone();
             let base_session = base_session.clone();
             let abort_signal = abort_signal.clone();
+            let execution_context = execution_context.clone();
             std::thread::spawn(move || {
                 let result = execute_expert_with_retries(
                     state,
@@ -8475,6 +8482,7 @@ fn execute_experts_bounded(
                     base_record,
                     base_session,
                     abort_signal,
+                    execution_context,
                 );
                 let _ = sender.send(result);
             });
@@ -8502,6 +8510,7 @@ fn synthesize_expert_outputs(
     base_record: ThreadRecord,
     base_session: Session,
     abort_signal: HookAbortSignal,
+    execution_context: Option<RunExecutionContext>,
 ) -> Result<String, String> {
     let synthetic_expert = ExpertPanelExpert {
         skill: "expert-brainstorm".to_string(),
@@ -8523,6 +8532,7 @@ fn synthesize_expert_outputs(
         base_record,
         base_session,
         abort_signal,
+        execution_context,
     )
     .map_err(|failure| failure.error)?;
     Ok(format!("### Final synthesis\n\n{}", output.content.trim()))
@@ -8567,16 +8577,21 @@ fn execute_expert_panel_run(
         outcome: current_run_outcome(&thread),
     })?;
 
+    let execution_context =
+        resolve_run_execution_context(&state.store, &record, &request).map_err(|error| RunFailure {
+            error: error.message.clone(),
+            outcome: current_run_outcome(&thread),
+        })?;
+    let effective_record = effective_record_for_run(&record, execution_context.as_ref());
+
     let mut panel_state = expert_run_response_from_audit(&thread, &controls.run_id)
         .unwrap_or_else(|| expert_run_initial_response(&record.id, &controls.run_id, &ExpertPanelRunRequest {
             question: Some(request.prompt.clone()),
             source_message_id: None,
-            knowledge_base_id: request
-                .execution_context
+            knowledge_base_id: execution_context
                 .as_ref()
                 .and_then(|context| context.knowledge_base_id.clone()),
-            auto_retrieval: request
-                .execution_context
+            auto_retrieval: execution_context
                 .as_ref()
                 .and_then(|context| context.auto_retrieval),
             experts: panel.experts.clone(),
@@ -8616,9 +8631,10 @@ fn execute_expert_panel_run(
         panel.experts,
         controls.retry_count,
         controls.concurrency_limit,
-        record.clone(),
+        effective_record.clone(),
         outcome_session.clone(),
         abort_signal.clone(),
+        execution_context.clone(),
     );
 
     let mut latest_session = outcome_session;
@@ -8679,9 +8695,10 @@ fn execute_expert_panel_run(
         request.prompt.clone(),
         &successes,
         &failures,
-        record,
+        effective_record,
         latest_session.clone(),
         abort_signal,
+        execution_context,
     )
     .unwrap_or_else(|_| format_fallback_expert_synthesis_message(&successes, &failures));
     latest_session = append_timeline_assistant_text(&state.store, &thread, synthesis).map_err(
@@ -12667,6 +12684,69 @@ mod tests {
         format!("http://{address}/v1")
     }
 
+    fn spawn_openai_capture_server(
+        response_body: &'static str,
+    ) -> (String, Arc<StdMutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_thread = captured.clone();
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 8192];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).expect("read request");
+                    if read == 0 {
+                        panic!("unexpected eof");
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let mut body = buffer[header_end..].to_vec();
+                while body.len() < content_length {
+                    let read = stream.read(&mut chunk).expect("read request body");
+                    if read == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..read]);
+                }
+                let request: Value = serde_json::from_slice(&body[..content_length])
+                    .expect("parse captured request body");
+                captured_for_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        (format!("http://{address}/v1"), captured)
+    }
+
     fn test_record(base_dir: &Path, owner_id: Option<&str>) -> ThreadRecord {
         ThreadRecord {
             id: super::generate_id("thread"),
@@ -14839,6 +14919,191 @@ mod tests {
             .audit_records
             .iter()
             .all(|record| record.kind != "run_started"));
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn create_expert_panel_run_does_not_persist_state_when_start_run_fails() {
+        let temp_dir = test_temp_dir("expert-panel-start-run-failure");
+        let mut config = test_config(temp_dir.clone());
+        config.max_concurrent_runs_global = Some(0);
+        let config = Arc::new(config);
+        let workspace_root = temp_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let state = Arc::new(AppState::new(config).expect("create app state"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
+
+        let created = create_thread(
+            State(state.clone()),
+            headers.clone(),
+            Query(AuthQuery::default()),
+            Json(CreateThreadRequest {
+                workspace_root: Some(workspace_root.display().to_string()),
+                project_id: None,
+                knowledge_base_id: None,
+                model: None,
+                model_base_url: None,
+                model_api_key: None,
+                permission_mode: None,
+                topic: Some("expert panel capacity failure".to_string()),
+            }),
+        )
+        .await
+        .expect("create thread")
+        .0;
+
+        let error = create_expert_panel_run(
+            State(state.clone()),
+            headers,
+            Query(AuthQuery::default()),
+            axum::extract::Path(created.id.clone()),
+            Json(ExpertPanelRunRequest {
+                question: Some("请组织专家讨论".to_string()),
+                source_message_id: None,
+                knowledge_base_id: None,
+                auto_retrieval: Some(true),
+                experts: vec![ExpertPanelExpert {
+                    skill: "mearsheimer".to_string(),
+                    scope: SkillScope::Workspace,
+                    label: "米尔斯海默".to_string(),
+                    description: None,
+                }],
+                retry_count: Some(1),
+                concurrency_limit: Some(1),
+            }),
+        )
+        .await
+        .expect_err("start_run capacity failure should bubble up");
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        let snapshot = state
+            .get_thread(&created.id)
+            .expect("thread exists")
+            .snapshot();
+        assert!(snapshot
+            .audit_records
+            .iter()
+            .all(|record| record.kind != "expert_panel_run_state"));
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn expert_panel_run_uses_override_execution_context_for_expert_turns() {
+        let temp_dir = test_temp_dir("expert-panel-override-context");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let workspace_root = temp_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let success_body = r#"{"id":"msg-1","model":"gpt-4o","choices":[{"message":{"role":"assistant","content":"captured response"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let (capturing_model_base_url, captured_requests) = spawn_openai_capture_server(success_body);
+
+        let state = Arc::new(AppState::new(config).expect("create app state"));
+        let mut knowledge_base = test_knowledge_base(&temp_dir, Some("alice"));
+        knowledge_base.id = "kb-override-context".to_string();
+        knowledge_base.name = "Override KB".to_string();
+        state
+            .store
+            .upsert_knowledge_base(&knowledge_base)
+            .expect("persist knowledge base");
+        state
+            .store
+            .upsert_data_source(&DataSourceRecord {
+                id: "source-web-1".to_string(),
+                knowledge_base_id: knowledge_base.id.clone(),
+                tenant_id: None,
+                owner_id: Some("alice".to_string()),
+                name: "Override Web Source".to_string(),
+                kind: DataSourceKind::Web,
+                description: Some("web source bound to override kb".to_string()),
+                config: json!({
+                    "urls": ["https://override.example.test/context"]
+                }),
+                status: Some("ready".to_string()),
+                last_test: None,
+                last_synced_at_ms: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("persist data source");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
+
+        let created = create_thread(
+            State(state.clone()),
+            headers.clone(),
+            Query(AuthQuery::default()),
+            Json(CreateThreadRequest {
+                workspace_root: Some(workspace_root.display().to_string()),
+                project_id: None,
+                knowledge_base_id: None,
+                model: Some("gpt-4o".to_string()),
+                model_base_url: Some(capturing_model_base_url),
+                model_api_key: Some("test-key".to_string()),
+                permission_mode: None,
+                topic: Some("专家上下文".to_string()),
+            }),
+        )
+        .await
+        .expect("create thread")
+        .0;
+
+        let _ = create_expert_panel_run(
+            State(state.clone()),
+            headers,
+            Query(AuthQuery::default()),
+            axum::extract::Path(created.id.clone()),
+            Json(ExpertPanelRunRequest {
+                question: Some("请组织专家讨论".to_string()),
+                source_message_id: None,
+                knowledge_base_id: Some(knowledge_base.id.clone()),
+                auto_retrieval: Some(false),
+                experts: vec![ExpertPanelExpert {
+                    skill: "mearsheimer".to_string(),
+                    scope: SkillScope::Workspace,
+                    label: "米尔斯海默".to_string(),
+                    description: None,
+                }],
+                retry_count: Some(1),
+                concurrency_limit: Some(1),
+            }),
+        )
+        .await
+        .expect("create expert panel run");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let request_count = captured_requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len();
+                if request_count >= 1 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("wait for expert request capture");
+
+        let requests = captured_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!requests.is_empty());
+        let expert_system_prompt = requests[0]
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(Value::as_object)
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("expert request system prompt");
+        assert!(expert_system_prompt.contains("# Connected Data Sources"));
+        assert!(expert_system_prompt.contains("https://override.example.test/context"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
