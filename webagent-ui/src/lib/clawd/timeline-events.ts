@@ -201,11 +201,17 @@ function executionContextSignature(context: ExecutionContext | null): string | n
     return null;
   }
 
-  const signature: ContextSignature = {
-    knowledgeBaseId: context.knowledgeBaseId ?? null,
-    knowledgeBaseName: context.knowledgeBaseName ?? null,
-    autoRetrieval: context.autoRetrieval,
-  };
+  const signature: ContextSignature = context.knowledgeBaseId
+    ? {
+        knowledgeBaseId: context.knowledgeBaseId,
+        knowledgeBaseName: null,
+        autoRetrieval: context.autoRetrieval,
+      }
+    : {
+        knowledgeBaseId: null,
+        knowledgeBaseName: context.knowledgeBaseName ?? null,
+        autoRetrieval: context.autoRetrieval,
+      };
 
   return JSON.stringify(signature);
 }

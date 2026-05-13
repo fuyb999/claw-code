@@ -426,6 +426,50 @@ describe("timeline-events", () => {
     expect(events.filter((event) => event.kind === "retrieval_policy")).toHaveLength(1);
   });
 
+  it("dedupes same-timestamp execution context when message has only KB id and audit adds the resolved KB name", () => {
+    const events = buildTimelineEvents(
+      thread({
+        updated_at_ms: 20,
+        messages: [
+          messageWithMetadata({
+            id: "m-user",
+            role: "user",
+            blocks: [{ type: "text", text: "继续当前分析" }],
+            metadata: {
+              effective_execution_context: {
+                knowledge_base_id: "kb-project",
+                auto_retrieval: true,
+              },
+            },
+          }),
+        ],
+        audit_records: [
+          {
+            id: "audit-ctx",
+            run_id: 7,
+            kind: "thread_run_context",
+            created_at_ms: 20,
+            payload: {
+              effective_execution_context: {
+                knowledge_base_id: "kb-project",
+                knowledge_base_name: "项目知识库",
+                auto_retrieval: true,
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+      "retrieval_policy",
+    ]);
+    expect(events.filter((event) => event.kind === "execution_scope")).toHaveLength(1);
+    expect(events.filter((event) => event.kind === "retrieval_policy")).toHaveLength(1);
+  });
+
   it("keeps equivalent execution context from audit records when the timestamp differs", () => {
     const events = buildTimelineEvents(
       thread({
