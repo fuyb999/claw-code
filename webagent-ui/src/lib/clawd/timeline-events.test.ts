@@ -29,13 +29,9 @@ function thread(overrides: Partial<ThreadSnapshot>): ThreadSnapshot {
 }
 
 function messageWithMetadata(
-  message: MessageSnapshot,
-  metadata: Record<string, unknown>,
-): MessageSnapshot {
-  return {
-    ...message,
-    metadata,
-  } as MessageSnapshot;
+  message: MessageSnapshot & { metadata: Record<string, unknown> | null },
+): MessageSnapshot & { metadata: Record<string, unknown> | null } {
+  return message;
 }
 
 describe("timeline-events", () => {
@@ -147,11 +143,11 @@ describe("timeline-events", () => {
               id: "m-user",
               role: "user",
               blocks: [{ type: "text", text: "请总结行业趋势" }],
-            },
-            {
+              metadata: {
               effective_execution_context: {
                 knowledge_base_name: "行业资料包",
                 auto_retrieval: false,
+              },
               },
             },
           ),
@@ -183,10 +179,10 @@ describe("timeline-events", () => {
               id: "m-user",
               role: "user",
               blocks: [{ type: "text", text: "请继续分析" }],
-            },
-            {
+              metadata: {
               effective_execution_context: {
                 auto_retrieval: true,
+              },
               },
             },
           ),
@@ -243,5 +239,48 @@ describe("timeline-events", () => {
         reference: null,
       },
     ]);
+  });
+
+  it("does not duplicate equivalent execution context from message metadata and audit records", () => {
+    const events = buildTimelineEvents(
+      thread({
+        updated_at_ms: 20,
+        messages: [
+          messageWithMetadata({
+            id: "m-user",
+            role: "user",
+            blocks: [{ type: "text", text: "继续当前分析" }],
+            metadata: {
+              effective_execution_context: {
+                knowledge_base_name: "项目知识库",
+                auto_retrieval: true,
+              },
+            },
+          }),
+        ],
+        audit_records: [
+          {
+            id: "audit-ctx",
+            run_id: 7,
+            kind: "thread_run_context",
+            created_at_ms: 20,
+            payload: {
+              effective_execution_context: {
+                knowledge_base_name: "项目知识库",
+                auto_retrieval: true,
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+      "retrieval_policy",
+    ]);
+    expect(events.filter((event) => event.kind === "execution_scope")).toHaveLength(1);
+    expect(events.filter((event) => event.kind === "retrieval_policy")).toHaveLength(1);
   });
 });

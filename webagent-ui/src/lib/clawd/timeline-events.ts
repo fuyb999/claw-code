@@ -41,6 +41,11 @@ type ExecutionContext = {
   autoRetrieval: boolean | null;
 };
 
+type ContextSignature = {
+  knowledgeBaseName: string | null;
+  autoRetrieval: boolean | null;
+};
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -88,7 +93,7 @@ function executionContextFromValue(value: unknown): ExecutionContext | null {
 }
 
 function executionContextFromMessage(message: ThreadSnapshot["messages"][number]): ExecutionContext | null {
-  const metadata = asRecord((message as { metadata?: unknown }).metadata);
+  const metadata = asRecord(message.metadata);
   if (!metadata) {
     return null;
   }
@@ -146,6 +151,19 @@ function timelineEventsFromExecutionContext(
   }
 
   return events;
+}
+
+function executionContextSignature(context: ExecutionContext | null): string | null {
+  if (!context) {
+    return null;
+  }
+
+  const signature: ContextSignature = {
+    knowledgeBaseName: context.knowledgeBaseName ?? null,
+    autoRetrieval: context.autoRetrieval,
+  };
+
+  return JSON.stringify(signature);
 }
 
 function textFromBlocks(blocks: MessageBlock[]): string {
@@ -231,6 +249,13 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
     return [];
   }
 
+  const messageContextSignatures = new Set(
+    thread.messages
+      .map(executionContextFromMessage)
+      .map(executionContextSignature)
+      .filter((signature): signature is string => signature !== null),
+  );
+
   const messageEvents = thread.messages.flatMap((message) => {
     const atMs = thread.updated_at_ms;
     const text = textFromBlocks(message.blocks);
@@ -294,9 +319,16 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
   const failedExpertEvents = thread.audit_records
     .map(expertFailureFromAudit)
     .filter((event): event is TimelineEvent => event !== null);
-  const auditContextEvents = thread.audit_records.flatMap((audit) =>
-    timelineEventsFromExecutionContext(audit.id, audit.created_at_ms, executionContextFromAudit(audit))
-  );
+  const auditContextEvents = thread.audit_records.flatMap((audit) => {
+    const context = executionContextFromAudit(audit);
+    const signature = executionContextSignature(context);
+
+    if (signature && messageContextSignatures.has(signature)) {
+      return [];
+    }
+
+    return timelineEventsFromExecutionContext(audit.id, audit.created_at_ms, context);
+  });
 
   return [...messageEvents, ...auditContextEvents, ...failedExpertEvents, ...artifactEvents].sort(
     (left, right) => left.atMs - right.atMs,

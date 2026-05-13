@@ -19,6 +19,7 @@ export interface MessageSnapshot {
   id: string;
   role: "system" | "user" | "assistant" | "tool";
   blocks: MessageBlock[];
+  metadata?: Record<string, unknown> | null;
 }
 
 export interface MemoryNote {
