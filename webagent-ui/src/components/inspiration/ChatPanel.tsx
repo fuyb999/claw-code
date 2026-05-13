@@ -45,6 +45,7 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [timelineExpanded, setTimelineExpanded] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -97,6 +98,9 @@ export function ChatPanel({
     onOpenReference?.({ kind: "evidence", id, anchor });
   };
 
+  const timelineVisibleEvents = timelineExpanded ? timelineEvents : timelineEvents.slice(-3);
+  const showTimelineToggle = timelineEvents.length > 3;
+
   return (
     <div className="relative flex-1 flex flex-col min-w-0 border-x border-border/30">
       <div className="shrink-0 border-b border-border/30 px-6 py-3">
@@ -111,16 +115,27 @@ export function ChatPanel({
           <p className="text-[11px] text-primary/80 mt-1 truncate">{expertRunLabel}</p>
         ) : null}
         <div className="mt-2">
-          <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/75">
-            时间线
-          </p>
+          <div className="mb-1 flex items-center justify-between gap-3">
+            <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/75">
+              时间线
+            </p>
+            {showTimelineToggle ? (
+              <button
+                className="text-[10px] font-medium text-primary/80 transition-colors hover:text-primary"
+                onClick={() => setTimelineExpanded((current) => !current)}
+                type="button"
+              >
+                {timelineExpanded ? "收起时间线" : "展开时间线"}
+              </button>
+            ) : null}
+          </div>
           {timelineEvents.length === 0 ? (
             <p className="text-[10px] text-muted-foreground/60">
               用户问题、检索、专家观点、引用和产物会在这里串联。
             </p>
           ) : (
-            <div className="grid gap-1 md:grid-cols-2 xl:grid-cols-3">
-              {timelineEvents.slice(-3).map((event) => (
+            <div className={timelineExpanded ? "flex flex-col gap-1" : "grid gap-1 md:grid-cols-2 xl:grid-cols-3"}>
+              {timelineVisibleEvents.map((event) => (
                 <TimelineEventCard
                   event={event}
                   key={event.id}

@@ -14,6 +14,8 @@ import type {
 export type TimelineEventKind =
   | "user_question"
   | "retrieval"
+  | "execution_scope"
+  | "retrieval_policy"
   | "expert_message"
   | "expert_failed"
   | "synthesis"
@@ -32,6 +34,120 @@ export interface TimelineEvent {
   subtitle: string;
   atMs: number;
   reference: TimelineEventReference | null;
+}
+
+type ExecutionContext = {
+  knowledgeBaseName: string | null;
+  autoRetrieval: boolean | null;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function booleanValue(record: Record<string, unknown> | null, keys: readonly string[]): boolean | null {
+  if (!record) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function executionContextFromValue(value: unknown): ExecutionContext | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const knowledgeBaseName = firstNonEmptyString(record, [
+    "knowledge_base_name",
+    "knowledgeBaseName",
+  ]);
+  const autoRetrieval = booleanValue(record, [
+    "auto_retrieval",
+    "autoRetrieval",
+  ]);
+
+  if (!knowledgeBaseName && autoRetrieval === null) {
+    return null;
+  }
+
+  return {
+    knowledgeBaseName,
+    autoRetrieval,
+  };
+}
+
+function executionContextFromMessage(message: ThreadSnapshot["messages"][number]): ExecutionContext | null {
+  const metadata = asRecord((message as { metadata?: unknown }).metadata);
+  if (!metadata) {
+    return null;
+  }
+
+  return (
+    executionContextFromValue(metadata.effective_execution_context) ??
+    executionContextFromValue(metadata.execution_context) ??
+    executionContextFromValue(metadata)
+  );
+}
+
+function executionContextFromAudit(audit: AuditRecord): ExecutionContext | null {
+  const payload = asRecord(audit.payload);
+  if (!payload) {
+    return null;
+  }
+
+  return (
+    executionContextFromValue(payload.effective_execution_context) ??
+    executionContextFromValue(payload.execution_context) ??
+    executionContextFromValue(payload.context) ??
+    executionContextFromValue(payload)
+  );
+}
+
+function timelineEventsFromExecutionContext(
+  idPrefix: string,
+  atMs: number,
+  context: ExecutionContext | null,
+): TimelineEvent[] {
+  if (!context) {
+    return [];
+  }
+
+  const events: TimelineEvent[] = [];
+
+  if (context.knowledgeBaseName) {
+    events.push({
+      id: `${idPrefix}:execution_scope`,
+      kind: "execution_scope",
+      title: "本次使用资料范围",
+      subtitle: context.knowledgeBaseName,
+      atMs,
+      reference: null,
+    });
+  }
+
+  if (context.autoRetrieval !== null) {
+    events.push({
+      id: `${idPrefix}:retrieval_policy`,
+      kind: "retrieval_policy",
+      title: context.autoRetrieval ? "自动检索已开启" : "自动检索已关闭",
+      subtitle: context.autoRetrieval ? "回答前可默认检索资料" : "不做默认前置检索",
+      atMs,
+      reference: null,
+    });
+  }
+
+  return events;
 }
 
 function textFromBlocks(blocks: MessageBlock[]): string {
@@ -121,6 +237,11 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
     const atMs = thread.updated_at_ms;
     const text = textFromBlocks(message.blocks);
     const retrievalEvents = retrievalEventsFromBlocks(message.id, atMs, message.blocks);
+    const contextEvents = timelineEventsFromExecutionContext(
+      message.id,
+      atMs,
+      executionContextFromMessage(message),
+    );
 
     if (message.role === "user" && text) {
       return [
@@ -132,6 +253,7 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
           atMs,
           reference: null,
         },
+        ...contextEvents,
         ...retrievalEvents,
       ];
     }
@@ -146,6 +268,7 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
           atMs,
           reference: null,
         },
+        ...contextEvents,
         ...retrievalEvents,
       ];
     }
@@ -161,19 +284,23 @@ export function buildTimelineEvents(thread: ThreadSnapshot | null): TimelineEven
           atMs,
           reference: null,
         },
+        ...contextEvents,
         ...retrievalEvents,
       ];
     }
 
-    return retrievalEvents;
+    return [...contextEvents, ...retrievalEvents];
   });
 
   const artifactEvents = thread.artifacts.map(eventFromArtifact);
   const failedExpertEvents = thread.audit_records
     .map(expertFailureFromAudit)
     .filter((event): event is TimelineEvent => event !== null);
+  const auditContextEvents = thread.audit_records.flatMap((audit) =>
+    timelineEventsFromExecutionContext(audit.id, audit.created_at_ms, executionContextFromAudit(audit))
+  );
 
-  return [...messageEvents, ...failedExpertEvents, ...artifactEvents].sort(
+  return [...messageEvents, ...auditContextEvents, ...failedExpertEvents, ...artifactEvents].sort(
     (left, right) => left.atMs - right.atMs,
   );
 }

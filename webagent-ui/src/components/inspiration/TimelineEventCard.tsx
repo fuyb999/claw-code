@@ -18,6 +18,9 @@ function iconFor(kind: TimelineEvent["kind"]) {
   switch (kind) {
     case "retrieval":
       return FileSearch;
+    case "execution_scope":
+    case "retrieval_policy":
+      return MessageSquare;
     case "expert_message":
       return Lightbulb;
     case "expert_failed":

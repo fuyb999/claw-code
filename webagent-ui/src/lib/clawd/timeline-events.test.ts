@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildTimelineEvents } from "./timeline-events";
-import type { ThreadSnapshot } from "./types";
+import type { MessageSnapshot, ThreadSnapshot } from "./types";
 
 function thread(overrides: Partial<ThreadSnapshot>): ThreadSnapshot {
   return {
@@ -26,6 +26,16 @@ function thread(overrides: Partial<ThreadSnapshot>): ThreadSnapshot {
     audit_records: [],
     ...overrides,
   };
+}
+
+function messageWithMetadata(
+  message: MessageSnapshot,
+  metadata: Record<string, unknown>,
+): MessageSnapshot {
+  return {
+    ...message,
+    metadata,
+  } as MessageSnapshot;
 }
 
 describe("timeline-events", () => {
@@ -123,6 +133,82 @@ describe("timeline-events", () => {
         title: "产业专家失败",
         subtitle: "已记录失败，其他专家继续执行",
         atMs: 10,
+        reference: null,
+      },
+    ]);
+  });
+
+  it("derives execution scope and retrieval policy from effective execution context metadata", () => {
+    const events = buildTimelineEvents(
+      thread({
+        messages: [
+          messageWithMetadata(
+            {
+              id: "m-user",
+              role: "user",
+              blocks: [{ type: "text", text: "请总结行业趋势" }],
+            },
+            {
+              effective_execution_context: {
+                knowledge_base_name: "行业资料包",
+                auto_retrieval: false,
+              },
+            },
+          ),
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+      "retrieval_policy",
+    ]);
+    expect(events.find((event) => event.kind === "execution_scope")).toMatchObject({
+      title: "本次使用资料范围",
+      subtitle: "行业资料包",
+    });
+    expect(events.find((event) => event.kind === "retrieval_policy")).toMatchObject({
+      title: "自动检索已关闭",
+      subtitle: "不做默认前置检索",
+    });
+  });
+
+  it("derives execution scope and retrieval policy from audit payload when message metadata is absent", () => {
+    const events = buildTimelineEvents(
+      thread({
+        audit_records: [
+          {
+            id: "audit-ctx",
+            run_id: 7,
+            kind: "thread_run_context",
+            created_at_ms: 6,
+            payload: {
+              effective_execution_context: {
+                knowledge_base_name: "项目知识库",
+                auto_retrieval: true,
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(events).toEqual([
+      {
+        id: "audit-ctx:execution_scope",
+        kind: "execution_scope",
+        title: "本次使用资料范围",
+        subtitle: "项目知识库",
+        atMs: 6,
+        reference: null,
+      },
+      {
+        id: "audit-ctx:retrieval_policy",
+        kind: "retrieval_policy",
+        title: "自动检索已开启",
+        subtitle: "回答前可默认检索资料",
+        atMs: 6,
         reference: null,
       },
     ]);
