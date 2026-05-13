@@ -7561,6 +7561,12 @@ async fn create_expert_panel_run(
             "thread is already running; interrupt first or wait for completion",
         ));
     }
+    let thread_record = thread
+        .shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record
+        .clone();
 
     let run_id = generate_id("expert-run");
     let prompt = if let Some(question) = request.question.clone() {
@@ -7574,6 +7580,15 @@ async fn create_expert_panel_run(
             )
         })?
     };
+    resolve_override_knowledge_base_for_run(
+        &state.store,
+        &thread_record,
+        Some(&RunExecutionContext {
+            knowledge_base_id: request.knowledge_base_id.clone(),
+            knowledge_base_name: None,
+            auto_retrieval: request.auto_retrieval,
+        }),
+    )?;
     let response = expert_run_initial_response(&thread_id, &run_id, &request);
     persist_expert_run_state(&state, &thread, &response)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -7768,6 +7783,7 @@ fn start_run(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record
         .clone();
+    let execution_context = resolve_run_execution_context(&state.store, &record, &request)?;
     let usage = {
         let threads = state
             .threads
@@ -7849,38 +7865,26 @@ fn start_run(
         &thread,
         "run_started",
         Some(run_id),
-        {
-            let execution_context = resolve_run_execution_context(&state.store, &record, &request)
-                .unwrap_or_else(|error| {
-                    eprintln!(
-                        "failed to resolve run execution context for thread {} run {}: {}",
-                        thread.id(),
-                        run_id,
-                        error
-                    );
-                    request.execution_context.clone()
-                });
-            json!({
-                "run_kind": request.kind,
-                "prompt": truncate_audit_text(&request.prompt),
-                "expert_panel": request.expert_panel.as_ref().map(|panel| json!({
-                    "panel_id": panel.panel_id,
-                    "master_skill": panel.master_skill,
-                    "experts": panel.experts.iter().map(|expert| json!({
-                        "skill": format!("{}:{}", expert.scope.as_str(), expert.skill),
-                        "label": expert.label,
-                    })).collect::<Vec<_>>(),
-                })),
-                "execution_context": execution_context,
-                "topic": thread
-                    .shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .record
-                    .topic
-                    .clone(),
-            })
-        },
+        json!({
+            "run_kind": request.kind,
+            "prompt": truncate_audit_text(&request.prompt),
+            "expert_panel": request.expert_panel.as_ref().map(|panel| json!({
+                "panel_id": panel.panel_id,
+                "master_skill": panel.master_skill,
+                "experts": panel.experts.iter().map(|expert| json!({
+                    "skill": format!("{}:{}", expert.scope.as_str(), expert.skill),
+                    "label": expert.label,
+                })).collect::<Vec<_>>(),
+            })),
+            "execution_context": execution_context,
+            "topic": thread
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record
+                .topic
+                .clone(),
+        }),
     );
     let snapshot = thread.snapshot();
     thread.publish("run_started", json!(snapshot.clone()));
@@ -8755,7 +8759,7 @@ fn execute_run(
     };
     let execution_context =
         resolve_run_execution_context(&state.store, &record, &request).map_err(|error| RunFailure {
-            error: error.to_string(),
+            error: error.message.clone(),
             outcome: current_run_outcome(&thread),
         })?;
     let effective_record = effective_record_for_run(&record, execution_context.as_ref());
@@ -11558,19 +11562,48 @@ fn resolve_thread_data_access(
     })
 }
 
+fn resolve_override_knowledge_base_for_run(
+    store: &ThreadStore,
+    record: &ThreadRecord,
+    execution_context: Option<&RunExecutionContext>,
+) -> Result<Option<KnowledgeBaseRecord>, AppError> {
+    let Some(knowledge_base_id) = execution_context
+        .and_then(|context| context.knowledge_base_id.as_deref())
+    else {
+        return Ok(None);
+    };
+
+    let knowledge_base = store
+        .get_knowledge_base(knowledge_base_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"))?;
+    if !knowledge_base_matches_user_scope(
+        &knowledge_base,
+        record.tenant_id.as_deref(),
+        record.owner_id.as_deref().unwrap_or_default(),
+    ) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "knowledge base not found",
+        ));
+    }
+
+    Ok(Some(knowledge_base))
+}
+
 fn resolve_run_execution_context(
     store: &ThreadStore,
     record: &ThreadRecord,
     request: &RunRequest,
-) -> Result<Option<RunExecutionContext>, Box<dyn std::error::Error>> {
+) -> Result<Option<RunExecutionContext>, AppError> {
     let Some(context) = request.execution_context.as_ref() else {
         return Ok(None);
     };
 
-    let knowledge_base_name = if let Some(knowledge_base_id) = context.knowledge_base_id.as_deref() {
-        store
-            .get_knowledge_base(knowledge_base_id)?
-            .map(|knowledge_base| knowledge_base.name)
+    let knowledge_base_name = if let Some(knowledge_base) =
+        resolve_override_knowledge_base_for_run(store, record, Some(context))?
+    {
+        Some(knowledge_base.name)
     } else {
         record.knowledge_base_name.clone()
     };
@@ -12480,7 +12513,7 @@ mod tests {
     use std::thread;
 
     use axum::extract::{Query, State};
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::Json;
     use runtime::{MessageRole, PermissionMode, Session};
     use rusqlite::Connection as TestSqliteConnection;
@@ -12508,7 +12541,7 @@ mod tests {
         ExpertPanelExpert, ExpertPanelRequest, execute_artifact_emit, execute_expert_panel_emit,
     };
     use api::InputContentBlock;
-    use crate::{create_thread, AuthQuery, CreateThreadRequest};
+    use crate::{create_expert_panel_run, create_thread, AuthQuery, CreateThreadRequest};
 
     fn test_thread(owner_id: Option<&str>) -> ManagedThread {
         ManagedThread::new(ThreadState {
@@ -14569,6 +14602,12 @@ mod tests {
         );
 
         let state = Arc::new(AppState::new(config).expect("create app state"));
+        let mut knowledge_base = test_knowledge_base(&temp_dir, Some("alice"));
+        knowledge_base.id = "kb-panel-alpha".to_string();
+        state
+            .store
+            .upsert_knowledge_base(&knowledge_base)
+            .expect("persist knowledge base");
 
         let mut headers = HeaderMap::new();
         headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
@@ -14666,6 +14705,140 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn user_message_command_rejects_nonexistent_override_knowledge_base() {
+        let temp_dir = test_temp_dir("user-message-missing-override-kb");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let workspace_root = temp_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let state = Arc::new(AppState::new(config).expect("create app state"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
+
+        let created = create_thread(
+            State(state.clone()),
+            headers.clone(),
+            Query(AuthQuery::default()),
+            Json(CreateThreadRequest {
+                workspace_root: Some(workspace_root.display().to_string()),
+                project_id: None,
+                knowledge_base_id: None,
+                model: None,
+                model_base_url: None,
+                model_api_key: None,
+                permission_mode: None,
+                topic: Some("override validation".to_string()),
+            }),
+        )
+        .await
+        .expect("create thread")
+        .0;
+
+        let error = post_thread_command(
+            State(state.clone()),
+            headers,
+            Query(AuthQuery::default()),
+            axum::extract::Path(created.id.clone()),
+            Json(CommandRequest::UserMessage {
+                content: "请读取资料库".to_string(),
+                expert_panel: None,
+                knowledge_base_id: Some("kb-missing".to_string()),
+                auto_retrieval: Some(true),
+            }),
+        )
+        .await
+        .expect_err("missing override knowledge base should be rejected");
+
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.message, "knowledge base not found");
+        let snapshot = state
+            .get_thread(&created.id)
+            .expect("thread exists")
+            .snapshot();
+        assert_eq!(snapshot.status, ThreadStatus::Idle);
+        assert!(snapshot
+            .audit_records
+            .iter()
+            .all(|record| record.kind != "run_started"));
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn create_expert_panel_run_rejects_inaccessible_override_knowledge_base() {
+        let temp_dir = test_temp_dir("expert-panel-inaccessible-override-kb");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let workspace_root = temp_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let state = Arc::new(AppState::new(config).expect("create app state"));
+
+        let inaccessible_kb = test_knowledge_base(&temp_dir, Some("bob"));
+        state
+            .store
+            .upsert_knowledge_base(&inaccessible_kb)
+            .expect("persist inaccessible knowledge base");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
+
+        let created = create_thread(
+            State(state.clone()),
+            headers.clone(),
+            Query(AuthQuery::default()),
+            Json(CreateThreadRequest {
+                workspace_root: Some(workspace_root.display().to_string()),
+                project_id: None,
+                knowledge_base_id: None,
+                model: None,
+                model_base_url: None,
+                model_api_key: None,
+                permission_mode: None,
+                topic: Some("override validation".to_string()),
+            }),
+        )
+        .await
+        .expect("create thread")
+        .0;
+
+        let error = create_expert_panel_run(
+            State(state.clone()),
+            headers,
+            Query(AuthQuery::default()),
+            axum::extract::Path(created.id.clone()),
+            Json(ExpertPanelRunRequest {
+                question: Some("请组织专家讨论".to_string()),
+                source_message_id: None,
+                knowledge_base_id: Some(inaccessible_kb.id.clone()),
+                auto_retrieval: Some(true),
+                experts: vec![ExpertPanelExpert {
+                    skill: "mearsheimer".to_string(),
+                    scope: SkillScope::Workspace,
+                    label: "米尔斯海默".to_string(),
+                    description: None,
+                }],
+                retry_count: Some(1),
+                concurrency_limit: Some(1),
+            }),
+        )
+        .await
+        .expect_err("inaccessible override knowledge base should be rejected");
+
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.message, "knowledge base not found");
+        let snapshot = state
+            .get_thread(&created.id)
+            .expect("thread exists")
+            .snapshot();
+        assert_eq!(snapshot.status, ThreadStatus::Idle);
+        assert!(snapshot
+            .audit_records
+            .iter()
+            .all(|record| record.kind != "run_started"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
