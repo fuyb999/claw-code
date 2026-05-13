@@ -94,16 +94,44 @@ function executionContextFromValue(value: unknown): ExecutionContext | null {
   };
 }
 
+function mergeExecutionContexts(...contexts: Array<ExecutionContext | null>): ExecutionContext | null {
+  let knowledgeBaseName: string | null = null;
+  let autoRetrieval: boolean | null = null;
+
+  for (const context of contexts) {
+    if (!context) {
+      continue;
+    }
+
+    if (knowledgeBaseName === null && context.knowledgeBaseName) {
+      knowledgeBaseName = context.knowledgeBaseName;
+    }
+
+    if (autoRetrieval === null && context.autoRetrieval !== null) {
+      autoRetrieval = context.autoRetrieval;
+    }
+  }
+
+  if (knowledgeBaseName === null && autoRetrieval === null) {
+    return null;
+  }
+
+  return {
+    knowledgeBaseName,
+    autoRetrieval,
+  };
+}
+
 function executionContextFromMessage(message: ThreadSnapshot["messages"][number]): ExecutionContext | null {
   const metadata = message.metadata;
   if (!metadata) {
     return null;
   }
 
-  return (
-    executionContextFromValue(metadata.effective_execution_context as MessageExecutionContextMetadata | null) ??
-    executionContextFromValue(metadata.execution_context as MessageExecutionContextMetadata | null) ??
-    executionContextFromValue(metadata)
+  return mergeExecutionContexts(
+    executionContextFromValue(metadata.effective_execution_context as MessageExecutionContextMetadata | null),
+    executionContextFromValue(metadata.execution_context as MessageExecutionContextMetadata | null),
+    executionContextFromValue(metadata),
   );
 }
 
@@ -113,11 +141,11 @@ function executionContextFromAudit(audit: AuditRecord): ExecutionContext | null 
     return null;
   }
 
-  return (
-    executionContextFromValue(payload.effective_execution_context) ??
-    executionContextFromValue(payload.execution_context) ??
-    executionContextFromValue(payload.context) ??
-    executionContextFromValue(payload)
+  return mergeExecutionContexts(
+    executionContextFromValue(payload.effective_execution_context),
+    executionContextFromValue(payload.execution_context),
+    executionContextFromValue(payload.context),
+    executionContextFromValue(payload),
   );
 }
 
