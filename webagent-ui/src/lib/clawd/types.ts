@@ -16,6 +16,8 @@ export type MessageBlock =
     };
 
 export interface ExecutionContextPayload {
+  knowledge_base_id?: string | null;
+  knowledgeBaseId?: string | null;
   knowledge_base_name?: string | null;
   knowledgeBaseName?: string | null;
   auto_retrieval?: boolean | null;

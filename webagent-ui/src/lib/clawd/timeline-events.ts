@@ -39,11 +39,13 @@ export interface TimelineEvent {
 }
 
 type ExecutionContext = {
+  knowledgeBaseId: string | null;
   knowledgeBaseName: string | null;
   autoRetrieval: boolean | null;
 };
 
 type ContextSignature = {
+  knowledgeBaseId: string | null;
   knowledgeBaseName: string | null;
   autoRetrieval: boolean | null;
 };
@@ -75,6 +77,10 @@ function executionContextFromValue(value: unknown): ExecutionContext | null {
   }
 
   const record = value as ExecutionContextPayload & Record<string, unknown>;
+  const knowledgeBaseId = firstNonEmptyString(record, [
+    "knowledge_base_id",
+    "knowledgeBaseId",
+  ]);
   const knowledgeBaseName = firstNonEmptyString(record, [
     "knowledge_base_name",
     "knowledgeBaseName",
@@ -84,23 +90,29 @@ function executionContextFromValue(value: unknown): ExecutionContext | null {
     "autoRetrieval",
   ]);
 
-  if (!knowledgeBaseName && autoRetrieval === null) {
+  if (!knowledgeBaseId && !knowledgeBaseName && autoRetrieval === null) {
     return null;
   }
 
   return {
+    knowledgeBaseId,
     knowledgeBaseName,
     autoRetrieval,
   };
 }
 
 function mergeExecutionContexts(...contexts: Array<ExecutionContext | null>): ExecutionContext | null {
+  let knowledgeBaseId: string | null = null;
   let knowledgeBaseName: string | null = null;
   let autoRetrieval: boolean | null = null;
 
   for (const context of contexts) {
     if (!context) {
       continue;
+    }
+
+    if (knowledgeBaseId === null && context.knowledgeBaseId) {
+      knowledgeBaseId = context.knowledgeBaseId;
     }
 
     if (knowledgeBaseName === null && context.knowledgeBaseName) {
@@ -112,11 +124,12 @@ function mergeExecutionContexts(...contexts: Array<ExecutionContext | null>): Ex
     }
   }
 
-  if (knowledgeBaseName === null && autoRetrieval === null) {
+  if (knowledgeBaseId === null && knowledgeBaseName === null && autoRetrieval === null) {
     return null;
   }
 
   return {
+    knowledgeBaseId,
     knowledgeBaseName,
     autoRetrieval,
   };
@@ -189,6 +202,7 @@ function executionContextSignature(context: ExecutionContext | null): string | n
   }
 
   const signature: ContextSignature = {
+    knowledgeBaseId: context.knowledgeBaseId ?? null,
     knowledgeBaseName: context.knowledgeBaseName ?? null,
     autoRetrieval: context.autoRetrieval,
   };

@@ -205,6 +205,67 @@ describe("timeline-events", () => {
     });
   });
 
+  it("derives execution scope from message metadata when only knowledge base id is present", () => {
+    const events = buildTimelineEvents(
+      thread({
+        messages: [
+          messageWithMetadata({
+            id: "m-user",
+            role: "user",
+            blocks: [{ type: "text", text: "请继续分析" }],
+            metadata: {
+              effective_execution_context: {
+                knowledge_base_id: "kb-only",
+              },
+            },
+          }),
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+    ]);
+    expect(events.find((event) => event.kind === "execution_scope")).toMatchObject({
+      title: "本次使用资料范围",
+      subtitle: "当前资料范围",
+    });
+  });
+
+  it("keeps retrieval policy visible for id-only execution context metadata", () => {
+    const events = buildTimelineEvents(
+      thread({
+        messages: [
+          messageWithMetadata({
+            id: "m-user",
+            role: "user",
+            blocks: [{ type: "text", text: "请继续分析" }],
+            metadata: {
+              effective_execution_context: {
+                knowledge_base_id: "kb-only",
+                auto_retrieval: true,
+              },
+            },
+          }),
+        ],
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "user_question",
+      "execution_scope",
+      "retrieval_policy",
+    ]);
+    expect(events.find((event) => event.kind === "execution_scope")).toMatchObject({
+      subtitle: "当前资料范围",
+    });
+    expect(events.find((event) => event.kind === "retrieval_policy")).toMatchObject({
+      title: "自动检索已开启",
+      subtitle: "回答前可默认检索资料",
+    });
+  });
+
   it("merges partial execution context across message metadata sources", () => {
     const events = buildTimelineEvents(
       thread({
