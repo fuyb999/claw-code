@@ -19,7 +19,7 @@ function source(
     name: overrides.name,
     kind: overrides.kind,
     description: overrides.description ?? null,
-    status: overrides.status ?? "ready",
+    status: overrides.status === undefined ? "ready" : overrides.status,
     endpoint: overrides.endpoint ?? null,
     index_name: overrides.index_name ?? null,
     auth_mode: overrides.auth_mode ?? null,
@@ -121,6 +121,44 @@ describe("source-model", () => {
     expect(model.platformSources).toMatchObject([
       { id: "notion-1", kind: "notion", searchable: false },
       { id: "conf-1", kind: "confluence", searchable: false },
+    ]);
+  });
+
+  it("does not mark otherwise searchable source kinds as searchable during null or intermediate statuses", () => {
+    const model = buildSourceRailModel({
+      dataSources: [
+        source({
+          id: "upload-pending",
+          knowledge_base_id: "kb-platform",
+          name: "待处理上传",
+          kind: "upload",
+          status: null,
+        }),
+        source({
+          id: "es-syncing",
+          knowledge_base_id: "kb-platform",
+          name: "同步中的检索库",
+          kind: "es",
+          status: "syncing",
+        }),
+        source({
+          id: "web-indexing",
+          knowledge_base_id: "kb-platform",
+          name: "建立索引中的网页",
+          kind: "web",
+          status: "indexing",
+        }),
+      ],
+      knowledgeBases: [kb({ id: "kb-platform", name: "平台知识", data_source_count: 3 })],
+      selectedKnowledgeBaseId: "kb-platform",
+    });
+
+    expect(model.personalUploads).toMatchObject([
+      { id: "upload-pending", kind: "upload", searchable: false },
+    ]);
+    expect(model.platformSources).toMatchObject([
+      { id: "es-syncing", kind: "es", searchable: false },
+      { id: "web-indexing", kind: "web", searchable: false },
     ]);
   });
 
