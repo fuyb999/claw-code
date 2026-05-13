@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
-    AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
-    ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig,
+    OutputContentBlock, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolResultContentBlock,
 };
 use async_stream::stream;
@@ -93,6 +93,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/v1/threads", get(list_threads).post(create_thread))
             .route("/v1/threads/:id", get(get_thread))
             .route("/v1/threads/:id/events", get(thread_events))
+            .route(
+                "/v1/threads/:id/expert-panel-runs",
+                post(create_expert_panel_run),
+            )
+            .route(
+                "/v1/threads/:id/expert-panel-runs/:run_id",
+                get(get_expert_panel_run),
+            )
+            .route(
+                "/v1/threads/:id/expert-panel-runs/:run_id/events",
+                get(expert_panel_run_events),
+            )
             .route("/v1/threads/:id/commands", post(post_thread_command))
             .layer(cors);
 
@@ -4010,6 +4022,8 @@ struct RunRequest {
     kind: RunKind,
     prompt: String,
     expert_panel: Option<ExpertPanelRequest>,
+    expert_run: Option<ExpertPanelRunExecution>,
+    execution_context: Option<RunExecutionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4017,6 +4031,7 @@ struct RunRequest {
 enum RunKind {
     UserMessage,
     Replan,
+    ExpertPanel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4033,6 +4048,115 @@ struct ExpertPanelExpert {
     label: String,
     #[serde(default)]
     description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertPanelRunExecution {
+    run_id: String,
+    retry_count: u8,
+    concurrency_limit: u8,
+}
+
+#[derive(Debug, Clone)]
+struct ExpertExecutionInput {
+    run_id: String,
+    question: String,
+    expert: ExpertPanelExpert,
+    attempt: u8,
+}
+
+#[derive(Debug, Clone)]
+struct ExpertExecutionOutput {
+    expert: ExpertPanelExpert,
+    attempts: u8,
+    content: String,
+    citations: Vec<String>,
+    confidence: Option<String>,
+    stance: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExpertExecutionFailure {
+    expert: ExpertPanelExpert,
+    attempts: u8,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertPanelRunRequest {
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    source_message_id: Option<String>,
+    #[serde(default)]
+    knowledge_base_id: Option<String>,
+    #[serde(default)]
+    auto_retrieval: Option<bool>,
+    experts: Vec<ExpertPanelExpert>,
+    #[serde(default)]
+    retry_count: Option<u8>,
+    #[serde(default)]
+    concurrency_limit: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunExecutionContext {
+    #[serde(default)]
+    knowledge_base_id: Option<String>,
+    #[serde(default)]
+    knowledge_base_name: Option<String>,
+    #[serde(default)]
+    auto_retrieval: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExpertPanelRunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExpertPanelExpertStatus {
+    Queued,
+    Running,
+    Retrying,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertPanelRunExpertState {
+    skill: String,
+    scope: SkillScope,
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+    status: ExpertPanelExpertStatus,
+    attempts: u8,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    citations: Vec<String>,
+    #[serde(default)]
+    confidence: Option<String>,
+    #[serde(default)]
+    stance: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpertPanelRunResponse {
+    run_id: String,
+    thread_id: String,
+    status: ExpertPanelRunStatus,
+    retry_count: u8,
+    concurrency_limit: u8,
+    experts: Vec<ExpertPanelRunExpertState>,
 }
 
 fn default_next_run_id() -> u64 {
@@ -4166,6 +4290,7 @@ struct ThreadSummary {
 
 #[derive(Debug, Clone, Serialize)]
 struct MessageSnapshot {
+    id: String,
     role: String,
     blocks: Vec<MessageBlockSnapshot>,
 }
@@ -4502,6 +4627,10 @@ enum CommandRequest {
         content: String,
         #[serde(default)]
         expert_panel: Option<ExpertPanelRequest>,
+        #[serde(default)]
+        knowledge_base_id: Option<String>,
+        #[serde(default)]
+        auto_retrieval: Option<bool>,
     },
     Interrupt {
         reason: Option<String>,
@@ -7279,6 +7408,8 @@ async fn post_thread_command(
         CommandRequest::UserMessage {
             content,
             expert_panel,
+            knowledge_base_id,
+            auto_retrieval,
         } => {
             let expert_panel = expert_panel
                 .map(normalize_expert_panel_request)
@@ -7291,6 +7422,12 @@ async fn post_thread_command(
                     kind: RunKind::UserMessage,
                     prompt: content,
                     expert_panel,
+                    expert_run: None,
+                    execution_context: Some(RunExecutionContext {
+                        knowledge_base_id: normalize_optional_text(knowledge_base_id),
+                        knowledge_base_name: None,
+                        auto_retrieval,
+                    }),
                 },
             )?;
         }
@@ -7327,6 +7464,8 @@ async fn post_thread_command(
                         kind: RunKind::Replan,
                         prompt,
                         expert_panel: None,
+                        expert_run: None,
+                        execution_context: None,
                     },
                 )?;
                 try_append_thread_audit(
@@ -7352,6 +7491,8 @@ async fn post_thread_command(
                     kind: RunKind::Replan,
                     prompt,
                     expert_panel: None,
+                    expert_run: None,
+                    execution_context: None,
                 },
             )?;
         }
@@ -7384,6 +7525,152 @@ async fn post_thread_command(
     }
 
     Ok(Json(thread.snapshot()))
+}
+
+async fn create_expert_panel_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath(thread_id): AxumPath<String>,
+    Json(request): Json<ExpertPanelRunRequest>,
+) -> Result<Json<ExpertPanelRunResponse>, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let thread = state.get_thread(&thread_id).ok_or_else(|| {
+        AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
+    })?;
+    ensure_thread_access(&thread, &auth)?;
+    if let Err(error) = consume_mutation_rate_limit(&state, &auth) {
+        try_append_thread_audit(
+            &state.store,
+            &thread,
+            "request_rejected",
+            None,
+            json!({
+                "reason": error.message.clone(),
+                "request": "expert_panel_run",
+            }),
+        );
+        return Err(error);
+    }
+
+    let request = normalize_expert_panel_run_request(request)
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error))?;
+    if is_running(&thread) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "thread is already running; interrupt first or wait for completion",
+        ));
+    }
+
+    let run_id = generate_id("expert-run");
+    let prompt = if let Some(question) = request.question.clone() {
+        question
+    } else {
+        let source_message_id = request.source_message_id.as_deref().unwrap_or_default();
+        resolve_source_message_text(&thread, source_message_id).ok_or_else(|| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!("source_message_id not found or has no visible text: {source_message_id}"),
+            )
+        })?
+    };
+    let response = expert_run_initial_response(&thread_id, &run_id, &request);
+    persist_expert_run_state(&state, &thread, &response)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    start_run(
+        state.clone(),
+        thread.clone(),
+        RunRequest {
+            kind: RunKind::ExpertPanel,
+            prompt,
+            expert_panel: Some(ExpertPanelRequest {
+                panel_id: run_id.clone(),
+                master_skill: "expert-brainstorm".to_string(),
+                experts: request.experts.clone(),
+            }),
+            expert_run: Some(ExpertPanelRunExecution {
+                run_id: run_id.clone(),
+                retry_count: request.retry_count.unwrap_or(1),
+                concurrency_limit: request.concurrency_limit.unwrap_or(3),
+            }),
+            execution_context: Some(RunExecutionContext {
+                knowledge_base_id: request.knowledge_base_id.clone(),
+                knowledge_base_name: None,
+                auto_retrieval: request.auto_retrieval,
+            }),
+        },
+    )?;
+
+    Ok(Json(response))
+}
+
+async fn get_expert_panel_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath((thread_id, run_id)): AxumPath<(String, String)>,
+) -> Result<Json<ExpertPanelRunResponse>, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let thread = state.get_thread(&thread_id).ok_or_else(|| {
+        AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
+    })?;
+    ensure_thread_access(&thread, &auth)?;
+    let response = expert_run_response_from_audit(&thread, &run_id).ok_or_else(|| {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("expert panel run not found: {run_id}"),
+        )
+    })?;
+    Ok(Json(response))
+}
+
+fn envelope_matches_expert_run(envelope: &ThreadEventEnvelope, run_id: &str) -> bool {
+    envelope.payload.get("run_id").and_then(Value::as_str) == Some(run_id)
+}
+
+async fn expert_panel_run_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath((thread_id, run_id)): AxumPath<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let thread = state.get_thread(&thread_id).ok_or_else(|| {
+        AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
+    })?;
+    ensure_thread_access(&thread, &auth)?;
+    let initial = expert_run_response_from_audit(&thread, &run_id).ok_or_else(|| {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("expert panel run not found: {run_id}"),
+        )
+    })?;
+    let mut receiver = thread.events.subscribe();
+
+    let stream = stream! {
+        yield Ok::<Event, std::convert::Infallible>(
+            Event::default()
+                .event("snapshot")
+                .data(serde_json::to_string(&initial).unwrap_or_else(|_| "{}".to_string()))
+        );
+        loop {
+            match receiver.recv().await {
+                Ok(envelope) => {
+                    if !envelope_matches_expert_run(&envelope, &run_id) {
+                        continue;
+                    }
+                    let payload = serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string());
+                    yield Ok::<Event, std::convert::Infallible>(
+                        Event::default().event(envelope.kind).data(payload)
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 fn queue_replan(thread: &Arc<ManagedThread>, request: RunRequest) -> Result<(), AppError> {
@@ -7562,25 +7849,38 @@ fn start_run(
         &thread,
         "run_started",
         Some(run_id),
-        json!({
-            "run_kind": request.kind,
-            "prompt": truncate_audit_text(&request.prompt),
-            "expert_panel": request.expert_panel.as_ref().map(|panel| json!({
-                "panel_id": panel.panel_id,
-                "master_skill": panel.master_skill,
-                "experts": panel.experts.iter().map(|expert| json!({
-                    "skill": format!("{}:{}", expert.scope.as_str(), expert.skill),
-                    "label": expert.label,
-                })).collect::<Vec<_>>(),
-            })),
-            "topic": thread
-                .shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record
-                .topic
-                .clone(),
-        }),
+        {
+            let execution_context = resolve_run_execution_context(&state.store, &record, &request)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "failed to resolve run execution context for thread {} run {}: {}",
+                        thread.id(),
+                        run_id,
+                        error
+                    );
+                    request.execution_context.clone()
+                });
+            json!({
+                "run_kind": request.kind,
+                "prompt": truncate_audit_text(&request.prompt),
+                "expert_panel": request.expert_panel.as_ref().map(|panel| json!({
+                    "panel_id": panel.panel_id,
+                    "master_skill": panel.master_skill,
+                    "experts": panel.experts.iter().map(|expert| json!({
+                        "skill": format!("{}:{}", expert.scope.as_str(), expert.skill),
+                        "label": expert.label,
+                    })).collect::<Vec<_>>(),
+                })),
+                "execution_context": execution_context,
+                "topic": thread
+                    .shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record
+                    .topic
+                    .clone(),
+            })
+        },
     );
     let snapshot = thread.snapshot();
     thread.publish("run_started", json!(snapshot.clone()));
@@ -7591,7 +7891,23 @@ fn start_run(
         let result = tokio::task::spawn_blocking({
             let thread = thread_for_task.clone();
             let state = state_for_task.clone();
-            move || execute_run(thread, state, run_id)
+            move || {
+                let kind = {
+                    let guard = thread
+                        .shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard
+                        .current_run
+                        .as_ref()
+                        .map(|active| active.request.kind.clone())
+                };
+                if matches!(kind, Some(RunKind::ExpertPanel)) {
+                    execute_expert_panel_run(thread, state, run_id)
+                } else {
+                    execute_run(thread, state, run_id)
+                }
+            }
         });
 
         let run_completion = if let Some(timeout_secs) = state_for_task.config.run_timeout_secs {
@@ -7781,6 +8097,632 @@ fn is_run_aborted(thread: &Arc<ManagedThread>, run_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+fn build_single_expert_prompt(question: &str, expert: &ExpertPanelExpert) -> String {
+    let description = expert
+        .description
+        .as_deref()
+        .map(|value| format!("\nExpert description: {value}"))
+        .unwrap_or_default();
+    format!(
+        "You are running as one independent expert skill for AI analyst.\n\
+Expert: {}\n\
+Skill: {}:{}{}\n\
+User question:\n\
+{}\n\n\
+Instructions:\n\
+- Load and follow this expert skill before answering.\n\
+- Search connected sources when evidence is needed.\n\
+- Return one expert opinion only, not the final synthesis.\n\
+- Include a short confidence label and stance label in plain text.\n\
+- Cite concrete source labels or query phrases when available.",
+        expert.label,
+        expert.scope.as_str(),
+        expert.skill,
+        description,
+        question
+    )
+}
+
+fn expert_sub_session_from_base(base: &Session, record: &ThreadRecord) -> Session {
+    let mut session = Session::new().with_workspace_root(record.workspace_root.clone());
+    session.messages = base.messages.clone();
+    session.model = Some(record.model.clone());
+    session
+}
+
+fn collect_new_assistant_text(session: &Session, start_index: usize) -> String {
+    session
+        .messages
+        .iter()
+        .skip(start_index)
+        .filter(|message| message.role == MessageRole::Assistant)
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string()
+}
+
+fn append_timeline_assistant_text(
+    store: &ThreadStore,
+    thread: &Arc<ManagedThread>,
+    text: String,
+) -> Result<Session, Box<dyn std::error::Error>> {
+    {
+        let mut guard = thread
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text { text }]))?;
+        guard.record.updated_at_ms = now_millis();
+    }
+    persist_thread_state(thread, store)?;
+    let snapshot = thread.snapshot();
+    thread.publish("message_added", json!(snapshot));
+    Ok(thread
+        .shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .session
+        .clone())
+}
+
+fn format_expert_success_message(output: &ExpertExecutionOutput) -> String {
+    let citations = if output.citations.is_empty() {
+        "Citations: not provided".to_string()
+    } else {
+        format!("Citations: {}", output.citations.join("; "))
+    };
+    format!(
+        "### {}\n\n{}\n\n{}\nConfidence: {}\nStance: {}",
+        output.expert.label,
+        output.content.trim(),
+        citations,
+        output.confidence.as_deref().unwrap_or("not marked"),
+        output.stance.as_deref().unwrap_or("not marked")
+    )
+}
+
+fn format_expert_failure_message(failure: &ExpertExecutionFailure) -> String {
+    format!(
+        "### {}\n\nThis expert failed after {} retry attempt(s).\n\nError: {}",
+        failure.expert.label,
+        failure.attempts.saturating_sub(1),
+        failure.error
+    )
+}
+
+fn format_expert_synthesis_prompt(
+    question: &str,
+    successes: &[ExpertExecutionOutput],
+    failures: &[ExpertExecutionFailure],
+) -> String {
+    let success_text = successes
+        .iter()
+        .map(|output| {
+            format!(
+                "Expert: {}\nOpinion:\n{}",
+                output.expert.label,
+                output.content.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let failure_text = failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.expert.label, failure.error))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Create the final synthesis for this multi-expert analyst run.\n\
+Question:\n{}\n\n\
+Successful expert outputs:\n{}\n\n\
+Failed experts:\n{}\n\n\
+Write a concise final answer that integrates the successful experts, explicitly records failed experts, and gives next action suggestions.",
+        question,
+        if success_text.is_empty() { "None" } else { &success_text },
+        if failure_text.is_empty() { "None" } else { &failure_text }
+    )
+}
+
+fn format_fallback_expert_synthesis_message(
+    successes: &[ExpertExecutionOutput],
+    failures: &[ExpertExecutionFailure],
+) -> String {
+    let success_names = successes
+        .iter()
+        .map(|output| output.expert.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let failure_names = failures
+        .iter()
+        .map(|failure| failure.expert.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "### Final synthesis\n\nIntegrated experts: {}.\n\nFailed experts: {}.\n\nContinue by asking for deeper evidence, a revised view, or a writing task.",
+        if success_names.is_empty() { "none" } else { &success_names },
+        if failure_names.is_empty() { "none" } else { &failure_names }
+    )
+}
+
+fn expert_failure_from_error(
+    expert: ExpertPanelExpert,
+    attempts: u8,
+    error: impl Into<String>,
+) -> ExpertExecutionFailure {
+    ExpertExecutionFailure {
+        expert,
+        attempts,
+        error: error.into(),
+    }
+}
+
+fn execute_single_expert_attempt(
+    state: Arc<AppState>,
+    thread: Arc<ManagedThread>,
+    run_id: u64,
+    input: ExpertExecutionInput,
+    base_record: ThreadRecord,
+    base_session: Session,
+    abort_signal: HookAbortSignal,
+) -> Result<ExpertExecutionOutput, ExpertExecutionFailure> {
+    let start_index = base_session.messages.len();
+    let permission_mode = parse_permission_mode(&base_record.permission_mode)
+        .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
+    let tool_registry = build_tool_registry()
+        .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
+    let data_access = resolve_thread_data_access(&state.store, &base_record)
+        .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string()))?;
+    let es_access = resolve_es_access(&state.config.es, &data_access);
+    let document_access = resolve_document_access(&data_access);
+    let web_access = resolve_web_access(&data_access);
+    let db_access = resolve_db_access(&data_access);
+    let allowed_tools = allowed_tool_names(
+        &state.config,
+        &tool_registry,
+        &base_record,
+        &es_access,
+        &document_access,
+        &web_access,
+        &db_access,
+    );
+    let policy = permission_policy(permission_mode, &tool_registry, &allowed_tools)
+        .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
+    let run_request = RunRequest {
+        kind: RunKind::ExpertPanel,
+        prompt: input.question.clone(),
+        expert_panel: Some(ExpertPanelRequest {
+            panel_id: input.run_id.clone(),
+            master_skill: "expert-brainstorm".to_string(),
+            experts: vec![input.expert.clone()],
+        }),
+        expert_run: Some(ExpertPanelRunExecution {
+            run_id: input.run_id.clone(),
+            retry_count: 0,
+            concurrency_limit: 1,
+        }),
+        execution_context: None,
+    };
+    let system_prompt = build_system_prompt(
+        &state.config,
+        &base_record,
+        &run_request,
+        &document_access,
+        &web_access,
+        &db_access,
+    )
+    .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string()))?;
+    let api_client = ServiceApiClient::new(
+        &base_record,
+        state.store.clone(),
+        tool_registry.clone(),
+        allowed_tools.clone(),
+        thread.clone(),
+        run_id,
+        abort_signal.clone(),
+        false,
+    )
+    .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
+    let tool_executor = ServiceToolExecutor::new(
+        tool_registry,
+        allowed_tools,
+        base_record.workspace_root.clone(),
+        es_access,
+        document_access,
+        web_access,
+        db_access,
+        state,
+        thread,
+        run_id,
+        abort_signal.clone(),
+    );
+    let mut runtime = ConversationRuntime::new(
+        expert_sub_session_from_base(&base_session, &base_record),
+        api_client,
+        tool_executor,
+        policy,
+        system_prompt,
+    )
+    .with_hook_abort_signal(abort_signal);
+
+    let prompt = build_single_expert_prompt(&input.question, &input.expert);
+    runtime.run_turn(prompt, None).map_err(|error| {
+        expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string())
+    })?;
+    let content = collect_new_assistant_text(runtime.session(), start_index);
+    if content.is_empty() {
+        return Err(expert_failure_from_error(
+            input.expert,
+            input.attempt,
+            "expert produced an empty response",
+        ));
+    }
+
+    Ok(ExpertExecutionOutput {
+        expert: input.expert,
+        attempts: input.attempt,
+        content,
+        citations: Vec::new(),
+        confidence: None,
+        stance: None,
+    })
+}
+
+fn execute_expert_with_retries(
+    state: Arc<AppState>,
+    thread: Arc<ManagedThread>,
+    run_id: u64,
+    panel_run_id: String,
+    question: String,
+    expert: ExpertPanelExpert,
+    retry_count: u8,
+    base_record: ThreadRecord,
+    base_session: Session,
+    abort_signal: HookAbortSignal,
+) -> Result<ExpertExecutionOutput, ExpertExecutionFailure> {
+    let max_attempts = retry_count.saturating_add(1);
+    let mut last_failure: Option<ExpertExecutionFailure> = None;
+
+    for attempt in 1..=max_attempts {
+        thread.publish(
+            "expert_run_event",
+            json!({
+                "run_id": panel_run_id,
+                "event": if attempt == 1 { "expert_started" } else { "expert_retrying" },
+                "expert": expert.label,
+                "attempt": attempt,
+            }),
+        );
+        let result = execute_single_expert_attempt(
+            state.clone(),
+            thread.clone(),
+            run_id,
+            ExpertExecutionInput {
+                run_id: panel_run_id.clone(),
+                question: question.clone(),
+                expert: expert.clone(),
+                attempt,
+            },
+            base_record.clone(),
+            base_session.clone(),
+            abort_signal.clone(),
+        );
+        match result {
+            Ok(output) => return Ok(output),
+            Err(failure) => last_failure = Some(failure),
+        }
+    }
+
+    Err(last_failure.unwrap_or_else(|| {
+        expert_failure_from_error(expert, max_attempts, "expert failed without an error payload")
+    }))
+}
+
+fn execute_experts_bounded(
+    state: Arc<AppState>,
+    thread: Arc<ManagedThread>,
+    run_id: u64,
+    panel_run_id: String,
+    question: String,
+    experts: Vec<ExpertPanelExpert>,
+    retry_count: u8,
+    concurrency_limit: u8,
+    base_record: ThreadRecord,
+    base_session: Session,
+    abort_signal: HookAbortSignal,
+) -> (Vec<ExpertExecutionOutput>, Vec<ExpertExecutionFailure>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut pending = std::collections::VecDeque::from(experts);
+    let mut active = 0_usize;
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    let limit = usize::from(concurrency_limit.max(1));
+
+    while !pending.is_empty() || active > 0 {
+        while active < limit {
+            let Some(expert) = pending.pop_front() else {
+                break;
+            };
+            active += 1;
+            let sender = sender.clone();
+            let state = state.clone();
+            let thread = thread.clone();
+            let panel_run_id = panel_run_id.clone();
+            let question = question.clone();
+            let base_record = base_record.clone();
+            let base_session = base_session.clone();
+            let abort_signal = abort_signal.clone();
+            std::thread::spawn(move || {
+                let result = execute_expert_with_retries(
+                    state,
+                    thread,
+                    run_id,
+                    panel_run_id,
+                    question,
+                    expert,
+                    retry_count,
+                    base_record,
+                    base_session,
+                    abort_signal,
+                );
+                let _ = sender.send(result);
+            });
+        }
+
+        match receiver.recv() {
+            Ok(Ok(output)) => successes.push(output),
+            Ok(Err(failure)) => failures.push(failure),
+            Err(_) => break,
+        }
+        active = active.saturating_sub(1);
+    }
+
+    (successes, failures)
+}
+
+fn synthesize_expert_outputs(
+    state: Arc<AppState>,
+    thread: Arc<ManagedThread>,
+    run_id: u64,
+    panel_run_id: String,
+    question: String,
+    successes: &[ExpertExecutionOutput],
+    failures: &[ExpertExecutionFailure],
+    base_record: ThreadRecord,
+    base_session: Session,
+    abort_signal: HookAbortSignal,
+) -> Result<String, String> {
+    let synthetic_expert = ExpertPanelExpert {
+        skill: "expert-brainstorm".to_string(),
+        scope: SkillScope::Workspace,
+        label: "Final synthesis".to_string(),
+        description: Some("Integrate successful expert outputs".to_string()),
+    };
+    let prompt = format_expert_synthesis_prompt(&question, successes, failures);
+    let output = execute_single_expert_attempt(
+        state,
+        thread,
+        run_id,
+        ExpertExecutionInput {
+            run_id: panel_run_id,
+            question: prompt,
+            expert: synthetic_expert,
+            attempt: 1,
+        },
+        base_record,
+        base_session,
+        abort_signal,
+    )
+    .map_err(|failure| failure.error)?;
+    Ok(format!("### Final synthesis\n\n{}", output.content.trim()))
+}
+
+fn execute_expert_panel_run(
+    thread: Arc<ManagedThread>,
+    state: Arc<AppState>,
+    run_id: u64,
+) -> Result<RunOutcome, RunFailure> {
+    let (record, session, request, abort_signal) = {
+        let guard = thread
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = guard
+            .current_run
+            .as_ref()
+            .ok_or_else(|| RunFailure {
+                error: "expert panel run missing active state".to_string(),
+                outcome: current_run_outcome(&thread),
+            })?;
+        if active.run_id != run_id {
+            return Err(RunFailure {
+                error: "stale expert panel run".to_string(),
+                outcome: current_run_outcome(&thread),
+            });
+        }
+        (
+            guard.record.clone(),
+            guard.session.clone(),
+            active.request.clone(),
+            active.abort_signal.clone(),
+        )
+    };
+    let panel = request.expert_panel.clone().ok_or_else(|| RunFailure {
+        error: "expert panel run missing expert panel request".to_string(),
+        outcome: current_run_outcome(&thread),
+    })?;
+    let controls = request.expert_run.clone().ok_or_else(|| RunFailure {
+        error: "expert panel run missing execution controls".to_string(),
+        outcome: current_run_outcome(&thread),
+    })?;
+
+    let mut panel_state = expert_run_response_from_audit(&thread, &controls.run_id)
+        .unwrap_or_else(|| expert_run_initial_response(&record.id, &controls.run_id, &ExpertPanelRunRequest {
+            question: Some(request.prompt.clone()),
+            source_message_id: None,
+            knowledge_base_id: request
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.knowledge_base_id.clone()),
+            auto_retrieval: request
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.auto_retrieval),
+            experts: panel.experts.clone(),
+            retry_count: Some(controls.retry_count),
+            concurrency_limit: Some(controls.concurrency_limit),
+        }));
+    panel_state.status = ExpertPanelRunStatus::Running;
+    let _ = persist_expert_run_state(&state, &thread, &panel_state);
+
+    let mut outcome_session = session.clone();
+    outcome_session
+        .push_user_text(request.prompt.clone())
+        .map_err(|error| RunFailure {
+            error: error.to_string(),
+            outcome: current_run_outcome(&thread),
+        })?;
+    {
+        let mut guard = thread
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.session = outcome_session.clone();
+        guard.record.updated_at_ms = now_millis();
+    }
+    persist_thread_state(&thread, &state.store).map_err(|error| RunFailure {
+        error: error.to_string(),
+        outcome: current_run_outcome(&thread),
+    })?;
+    thread.publish("message_added", json!(thread.snapshot()));
+
+    let (successes, failures) = execute_experts_bounded(
+        state.clone(),
+        thread.clone(),
+        run_id,
+        controls.run_id.clone(),
+        request.prompt.clone(),
+        panel.experts,
+        controls.retry_count,
+        controls.concurrency_limit,
+        record.clone(),
+        outcome_session.clone(),
+        abort_signal.clone(),
+    );
+
+    let mut latest_session = outcome_session;
+    for output in &successes {
+        latest_session = append_timeline_assistant_text(
+            &state.store,
+            &thread,
+            format_expert_success_message(output),
+        )
+        .map_err(|error| RunFailure {
+            error: error.to_string(),
+            outcome: current_run_outcome(&thread),
+        })?;
+        thread.publish(
+            "expert_run_event",
+            json!({
+                "run_id": controls.run_id,
+                "event": "expert_completed",
+                "expert": output.expert.label,
+                "attempt": output.attempts,
+            }),
+        );
+    }
+    for failure in &failures {
+        latest_session = append_timeline_assistant_text(
+            &state.store,
+            &thread,
+            format_expert_failure_message(failure),
+        )
+        .map_err(|error| RunFailure {
+            error: error.to_string(),
+            outcome: current_run_outcome(&thread),
+        })?;
+        thread.publish(
+            "expert_run_event",
+            json!({
+                "run_id": controls.run_id,
+                "event": "expert_failed",
+                "expert": failure.expert.label,
+                "attempt": failure.attempts,
+                "error": failure.error,
+            }),
+        );
+    }
+
+    thread.publish(
+        "expert_run_event",
+        json!({
+            "run_id": controls.run_id,
+            "event": "synthesizing",
+        }),
+    );
+    let synthesis = synthesize_expert_outputs(
+        state.clone(),
+        thread.clone(),
+        run_id,
+        controls.run_id.clone(),
+        request.prompt.clone(),
+        &successes,
+        &failures,
+        record,
+        latest_session.clone(),
+        abort_signal,
+    )
+    .unwrap_or_else(|_| format_fallback_expert_synthesis_message(&successes, &failures));
+    latest_session = append_timeline_assistant_text(&state.store, &thread, synthesis).map_err(
+        |error| RunFailure {
+            error: error.to_string(),
+            outcome: current_run_outcome(&thread),
+        },
+    )?;
+
+    if let Some(mut final_state) = expert_run_response_from_audit(&thread, &controls.run_id) {
+        final_state.status = if successes.is_empty() && !failures.is_empty() {
+            ExpertPanelRunStatus::Failed
+        } else {
+            ExpertPanelRunStatus::Succeeded
+        };
+        for expert_state in &mut final_state.experts {
+            if let Some(output) = successes.iter().find(|output| {
+                output.expert.skill == expert_state.skill && output.expert.scope == expert_state.scope
+            }) {
+                expert_state.status = ExpertPanelExpertStatus::Succeeded;
+                expert_state.attempts = output.attempts;
+                expert_state.content = Some(output.content.clone());
+            } else if let Some(failure) = failures.iter().find(|failure| {
+                failure.expert.skill == expert_state.skill && failure.expert.scope == expert_state.scope
+            }) {
+                expert_state.status = ExpertPanelExpertStatus::Failed;
+                expert_state.attempts = failure.attempts;
+                expert_state.error = Some(failure.error.clone());
+            }
+        }
+        let _ = persist_expert_run_state(&state, &thread, &final_state);
+    }
+    thread.publish(
+        "expert_run_event",
+        json!({
+            "run_id": controls.run_id,
+            "event": "completed",
+        }),
+    );
+
+    Ok(RunOutcome {
+        session: latest_session,
+    })
+}
+
 fn execute_run(
     thread: Arc<ManagedThread>,
     state: Arc<AppState>,
@@ -7811,9 +8753,15 @@ fn execute_run(
             active.abort_signal.clone(),
         )
     };
+    let execution_context =
+        resolve_run_execution_context(&state.store, &record, &request).map_err(|error| RunFailure {
+            error: error.to_string(),
+            outcome: current_run_outcome(&thread),
+        })?;
+    let effective_record = effective_record_for_run(&record, execution_context.as_ref());
 
     let permission_mode =
-        parse_permission_mode(&record.permission_mode).map_err(|error| RunFailure {
+        parse_permission_mode(&effective_record.permission_mode).map_err(|error| RunFailure {
             error: error.to_string(),
             outcome: current_run_outcome(&thread),
         })?;
@@ -7821,7 +8769,8 @@ fn execute_run(
         error: error.to_string(),
         outcome: current_run_outcome(&thread),
     })?;
-    let data_access = resolve_thread_data_access(&state.store, &record).map_err(|error| RunFailure {
+    let data_access =
+        resolve_thread_data_access(&state.store, &effective_record).map_err(|error| RunFailure {
         error: error.to_string(),
         outcome: current_run_outcome(&thread),
     })?;
@@ -7832,7 +8781,7 @@ fn execute_run(
     let allowed_tools = allowed_tool_names(
         &state.config,
         &tool_registry,
-        &record,
+        &effective_record,
         &es_access,
         &document_access,
         &web_access,
@@ -7845,7 +8794,7 @@ fn execute_run(
         })?;
     let system_prompt = build_system_prompt(
         &state.config,
-        &record,
+        &effective_record,
         &request,
         &document_access,
         &web_access,
@@ -7856,13 +8805,14 @@ fn execute_run(
             outcome: current_run_outcome(&thread),
         })?;
     let api_client = ServiceApiClient::new(
-        &record,
+        &effective_record,
         state.store.clone(),
         tool_registry.clone(),
         allowed_tools.clone(),
         thread.clone(),
         run_id,
         abort_signal.clone(),
+        true,
     )
     .map_err(|error| RunFailure {
         error,
@@ -7932,6 +8882,7 @@ fn build_system_prompt(
             &date,
             std::env::consts::OS,
             "unknown",
+            model_family_identity_for(&record.model),
         )?
     };
     let topic = record
@@ -8046,7 +8997,7 @@ This run is a structured multi-expert workflow.\n\
         }
         if !web_access.urls.is_empty() {
             access_notes.push(format!(
-                "- Connected web sources available via WebFetch: {}",
+                "- Connected web sources available via SourceWebFetch: {}",
                 web_access.urls.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
             ));
         }
@@ -8115,6 +9066,7 @@ struct ServiceApiClient {
     thread: Arc<ManagedThread>,
     run_id: u64,
     abort_signal: HookAbortSignal,
+    stream_to_thread: bool,
 }
 
 impl ServiceApiClient {
@@ -8126,6 +9078,7 @@ impl ServiceApiClient {
         thread: Arc<ManagedThread>,
         run_id: u64,
         abort_signal: HookAbortSignal,
+        stream_to_thread: bool,
     ) -> Result<Self, String> {
         let base_url = resolve_model_access_value(
             record.model_access.base_url.as_deref(),
@@ -8153,6 +9106,7 @@ impl ServiceApiClient {
             thread,
             run_id,
             abort_signal,
+            stream_to_thread,
         })
     }
 
@@ -8191,6 +9145,7 @@ impl ServiceApiClient {
                             &mut pending_tool,
                             block,
                             true,
+                            self.stream_to_thread,
                         );
                     }
                 }
@@ -8201,14 +9156,17 @@ impl ServiceApiClient {
                         &mut pending_tool,
                         start.content_block,
                         true,
+                        self.stream_to_thread,
                     );
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
-                            append_draft_text(&self.thread, &text);
-                            self.thread
-                                .publish("assistant_text_delta", json!({ "text": text }));
+                            if self.stream_to_thread {
+                                append_draft_text(&self.thread, &text);
+                                self.thread
+                                    .publish("assistant_text_delta", json!({ "text": text }));
+                            }
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -8262,7 +9220,13 @@ impl ServiceApiClient {
             })
             .await
             .map_err(|error| RuntimeError::new(format!("provider response failed: {error}")))?;
-        response_to_events(&self.thread, self.store.as_ref(), self.run_id, response)
+        response_to_events(
+            &self.thread,
+            self.store.as_ref(),
+            self.run_id,
+            response,
+            self.stream_to_thread,
+        )
     }
 }
 
@@ -8334,7 +9298,7 @@ impl ServiceToolExecutor {
             "EsSearch" => execute_es_search(&self.es_access, value),
             "SourceSearch" => execute_source_search(&self.document_access, value),
             "SourceRead" => execute_source_read(&self.document_access, value),
-            "WebFetch" => execute_web_fetch(&self.web_access, value),
+            "SourceWebFetch" => execute_web_fetch(&self.web_access, value),
             "DbQuery" => execute_db_query(&self.db_access, value),
             "MemoryWrite" => execute_memory_write(&self.state, &self.thread, self.run_id, value),
             "MemorySearch" => execute_memory_search(&self.state, &self.thread, value),
@@ -8716,7 +9680,7 @@ fn execute_source_read(
 
 fn execute_web_fetch(access: &ResolvedWebAccess, value: Value) -> Result<String, ToolError> {
     let input: WebFetchInput = serde_json::from_value(value)
-        .map_err(|error| ToolError::new(format!("invalid WebFetch input: {error}")))?;
+        .map_err(|error| ToolError::new(format!("invalid SourceWebFetch input: {error}")))?;
     if access.urls.is_empty() {
         return Err(ToolError::new(
             json!({
@@ -9326,7 +10290,7 @@ fn maybe_emit_tool_result_artifact(
     };
 
     match tool_name {
-        "WebFetch" => {
+        "SourceWebFetch" => {
             let url = object
                 .get("url")
                 .and_then(Value::as_str)
@@ -9359,7 +10323,7 @@ fn maybe_emit_tool_result_artifact(
             ) {
                 Ok(artifact) => Some(artifact),
                 Err(error) => {
-                    eprintln!("failed to persist WebFetch artifact: {error}");
+                    eprintln!("failed to persist SourceWebFetch artifact: {error}");
                     None
                 }
             }
@@ -9490,7 +10454,7 @@ fn build_tool_registry() -> Result<GlobalToolRegistry, String> {
             required_permission: PermissionMode::ReadOnly,
         },
         RuntimeToolDefinition {
-            name: "WebFetch".to_string(),
+            name: "SourceWebFetch".to_string(),
             description: Some("Fetch and summarize text from a connected web page.".to_string()),
             input_schema: json!({
                 "type": "object",
@@ -9676,7 +10640,7 @@ fn allowed_tool_names(
                         || (name == "EsSearch" && has_es_access)
                         || (name == "SourceSearch" && has_document_access)
                         || (name == "SourceRead" && has_document_access)
-                        || (name == "WebFetch" && has_web_access)
+                        || (name == "SourceWebFetch" && has_web_access)
                         || (name == "DbQuery" && has_db_access)
                 }),
         )
@@ -9762,26 +10726,27 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
+                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -9798,12 +10763,15 @@ fn push_output_block(
     pending_tool: &mut Option<(String, String, String)>,
     block: OutputContentBlock,
     streaming_tool_input: bool,
+    stream_to_thread: bool,
 ) {
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                append_draft_text(thread, &text);
-                thread.publish("assistant_text_delta", json!({ "text": text }));
+                if stream_to_thread {
+                    append_draft_text(thread, &text);
+                    thread.publish("assistant_text_delta", json!({ "text": text }));
+                }
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
@@ -9828,11 +10796,19 @@ fn response_to_events(
     store: &ThreadStore,
     run_id: u64,
     response: MessageResponse,
+    stream_to_thread: bool,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
     for block in response.content {
-        push_output_block(thread, &mut events, &mut pending_tool, block, false);
+        push_output_block(
+            thread,
+            &mut events,
+            &mut pending_tool,
+            block,
+            false,
+            stream_to_thread,
+        );
         if let Some((id, name, input)) = pending_tool.take() {
             thread.publish(
                 "tool_use",
@@ -9933,7 +10909,8 @@ fn snapshot_from_state(state: &ThreadState) -> ThreadSnapshot {
             .session
             .messages
             .iter()
-            .map(message_snapshot)
+            .enumerate()
+            .map(|(index, message)| message_snapshot(&state.record.id, index, message))
             .collect(),
         memory_notes: state.visible_memory_notes.clone(),
         artifacts: state.record.artifacts.clone(),
@@ -10581,6 +11558,44 @@ fn resolve_thread_data_access(
     })
 }
 
+fn resolve_run_execution_context(
+    store: &ThreadStore,
+    record: &ThreadRecord,
+    request: &RunRequest,
+) -> Result<Option<RunExecutionContext>, Box<dyn std::error::Error>> {
+    let Some(context) = request.execution_context.as_ref() else {
+        return Ok(None);
+    };
+
+    let knowledge_base_name = if let Some(knowledge_base_id) = context.knowledge_base_id.as_deref() {
+        store
+            .get_knowledge_base(knowledge_base_id)?
+            .map(|knowledge_base| knowledge_base.name)
+    } else {
+        record.knowledge_base_name.clone()
+    };
+
+    Ok(Some(RunExecutionContext {
+        knowledge_base_id: context.knowledge_base_id.clone(),
+        knowledge_base_name,
+        auto_retrieval: context.auto_retrieval,
+    }))
+}
+
+fn effective_record_for_run(
+    record: &ThreadRecord,
+    execution_context: Option<&RunExecutionContext>,
+) -> ThreadRecord {
+    let mut effective = record.clone();
+    if let Some(context) = execution_context {
+        if context.knowledge_base_id.is_some() {
+            effective.knowledge_base_id = context.knowledge_base_id.clone();
+            effective.knowledge_base_name = context.knowledge_base_name.clone();
+        }
+    }
+    effective
+}
+
 fn string_config_value(config: &Value, key: &str) -> Option<String> {
     config
         .get(key)
@@ -10753,8 +11768,36 @@ fn parse_document_file_record(value: &Value) -> Option<DocumentFileRecord> {
     serde_json::from_value::<DocumentFileRecord>(value.clone()).ok()
 }
 
-fn message_snapshot(message: &ConversationMessage) -> MessageSnapshot {
+fn thread_message_id(thread_id: &str, index: usize) -> String {
+    format!("{thread_id}-message-{index}")
+}
+
+fn resolve_source_message_text(thread: &Arc<ManagedThread>, source_message_id: &str) -> Option<String> {
+    let guard = thread
+        .shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prefix = format!("{}-message-", guard.record.id);
+    let index = source_message_id
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse::<usize>().ok())?;
+    let message = guard.session.messages.get(index)?;
+    let text = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn message_snapshot(thread_id: &str, index: usize, message: &ConversationMessage) -> MessageSnapshot {
     MessageSnapshot {
+        id: thread_message_id(thread_id, index),
         role: match message.role {
             MessageRole::System => "system",
             MessageRole::User => "user",
@@ -10765,24 +11808,25 @@ fn message_snapshot(message: &ConversationMessage) -> MessageSnapshot {
         blocks: message
             .blocks
             .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => MessageBlockSnapshot::Text { text: text.clone() },
-                ContentBlock::ToolUse { id, name, input } => MessageBlockSnapshot::ToolUse {
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(MessageBlockSnapshot::Text { text: text.clone() }),
+                ContentBlock::Thinking { .. } => None,
+                ContentBlock::ToolUse { id, name, input } => Some(MessageBlockSnapshot::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                },
+                }),
                 ContentBlock::ToolResult {
                     tool_use_id,
                     tool_name,
                     output,
                     is_error,
-                } => MessageBlockSnapshot::ToolResult {
+                } => Some(MessageBlockSnapshot::ToolResult {
                     tool_use_id: tool_use_id.clone(),
                     tool_name: tool_name.clone(),
                     output: output.clone(),
                     is_error: *is_error,
-                },
+                }),
             })
             .collect(),
     }
@@ -10928,22 +11972,114 @@ fn normalize_expert_panel_request(
     })
 }
 
-fn truncate_audit_list(values: &[String], max_items: usize, max_chars: usize) -> Vec<String> {
-    values
-        .iter()
-        .take(max_items)
-        .map(|value| truncate_audit_text_with_limit(value, max_chars))
-        .collect()
+fn normalize_expert_panel_run_request(
+    input: ExpertPanelRunRequest,
+) -> Result<ExpertPanelRunRequest, String> {
+    let question = normalize_optional_text(input.question);
+    let source_message_id = normalize_optional_text(input.source_message_id);
+    let knowledge_base_id = normalize_optional_text(input.knowledge_base_id);
+    let auto_retrieval = input.auto_retrieval;
+    if question.is_some() == source_message_id.is_some() {
+        return Err(
+            "expert panel run requires exactly one of question or source_message_id".to_string(),
+        );
+    }
+
+    let panel = normalize_expert_panel_request(ExpertPanelRequest {
+        panel_id: "validation".to_string(),
+        master_skill: "expert-brainstorm".to_string(),
+        experts: input.experts,
+    })?;
+
+    let retry_count = input.retry_count.unwrap_or(1).min(3);
+    let concurrency_limit = input.concurrency_limit.unwrap_or(3).clamp(1, 8);
+
+    Ok(ExpertPanelRunRequest {
+        question,
+        source_message_id,
+        knowledge_base_id,
+        auto_retrieval,
+        experts: panel.experts,
+        retry_count: Some(retry_count),
+        concurrency_limit: Some(concurrency_limit),
+    })
 }
 
-fn truncate_audit_text_with_limit(value: &str, max_chars: usize) -> String {
-    let trimmed = value.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
+fn expert_run_initial_response(
+    thread_id: &str,
+    run_id: &str,
+    request: &ExpertPanelRunRequest,
+) -> ExpertPanelRunResponse {
+    ExpertPanelRunResponse {
+        run_id: run_id.to_string(),
+        thread_id: thread_id.to_string(),
+        status: ExpertPanelRunStatus::Running,
+        retry_count: request.retry_count.unwrap_or(1),
+        concurrency_limit: request.concurrency_limit.unwrap_or(3),
+        experts: request
+            .experts
+            .iter()
+            .map(|expert| ExpertPanelRunExpertState {
+                skill: expert.skill.clone(),
+                scope: expert.scope,
+                label: expert.label.clone(),
+                description: expert.description.clone(),
+                status: ExpertPanelExpertStatus::Queued,
+                attempts: 0,
+                content: None,
+                citations: Vec::new(),
+                confidence: None,
+                stance: None,
+                error: None,
+            })
+            .collect(),
     }
-    let mut truncated = trimmed.chars().take(max_chars).collect::<String>();
-    truncated.push_str("...");
-    truncated
+}
+
+fn expert_run_response_from_audit(
+    thread: &Arc<ManagedThread>,
+    run_id: &str,
+) -> Option<ExpertPanelRunResponse> {
+    let guard = thread
+        .shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .audit_records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.kind == "expert_panel_run_state"
+                && record
+                    .payload
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    == Some(run_id)
+        })
+        .and_then(|record| serde_json::from_value(record.payload.clone()).ok())
+}
+
+fn persist_expert_run_state(
+    state: &Arc<AppState>,
+    thread: &Arc<ManagedThread>,
+    response: &ExpertPanelRunResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    append_thread_audit(
+        &state.store,
+        thread,
+        "expert_panel_run_state",
+        None,
+        serde_json::to_value(response)?,
+    )?;
+    thread.publish(
+        "expert_run_event",
+        json!({
+            "run_id": response.run_id,
+            "event": "state_changed",
+            "status": response.status,
+        }),
+    );
+    Ok(())
 }
 
 fn parse_user_id(value: &str) -> Result<String, String> {
@@ -11355,13 +12491,14 @@ mod tests {
         delete_service_skill_file, discover_allowed_roots, ensure_mutation_rate_limit,
         ensure_run_capacity, ensure_thread_capacity, import_legacy_thread_records,
         list_service_skills, load_threads, mutation_user_scope_key,
-        normalize_project_default_skill_names, normalize_terms, parse_bootstrap_api_keys,
+        normalize_expert_panel_run_request, normalize_project_default_skill_names, normalize_terms, parse_bootstrap_api_keys,
         parse_limit_env, parse_run_timeout_secs, parse_skill_starter_prompt_from_contents,
         parse_skill_tags_from_contents, parse_user_id, persist_thread_state, render_skill_prompt,
         resolve_es_access, resolve_service_skill, rewrite_tool_input, sqlite_path_from_url, thread_is_visible_to_auth,
         provider_client_from_record, provider_kind_for_model_access, request_model_for_model_access,
         ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord, AuditRecord, AuthContext, AuthMode,
         CapacityUsage, CommandRequest, DataSourceKind, DataSourceRecord, EsConfig,
+        ExpertPanelRunRequest,
         KnowledgeBaseRecord, ManagedThread, MemoryNote, MemoryScope, MemorySearchScope,
         MessageBlockSnapshot, ModelAccessConfig, MutationRateLimiter, MutationRateUsage,
         ProjectRecord, ProviderKind, ResolvedDataAccess, ResolvedDbAccess,
@@ -11370,6 +12507,7 @@ mod tests {
         CURRENT_DATABASE_SCHEMA_VERSION, post_thread_command,
         ExpertPanelExpert, ExpertPanelRequest, execute_artifact_emit, execute_expert_panel_emit,
     };
+    use api::InputContentBlock;
     use crate::{create_thread, AuthQuery, CreateThreadRequest};
 
     fn test_thread(owner_id: Option<&str>) -> ManagedThread {
@@ -11431,6 +12569,8 @@ mod tests {
                     kind: RunKind::UserMessage,
                     prompt: "test".to_string(),
                     expert_panel: None,
+                    expert_run: None,
+                    execution_context: None,
                 },
             });
             guard.status = ThreadStatus::Running;
@@ -11454,6 +12594,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             data_dir: data_dir.clone(),
             web_dist_dir: None,
+            service_skills_dir: None,
             database_url: default_database_url(&data_dir),
             default_model: "claude-sonnet-4-6".to_string(),
             default_permission_mode: PermissionMode::ReadOnly,
@@ -12037,6 +13178,8 @@ mod tests {
                 kind: RunKind::UserMessage,
                 prompt: "分析仓库".to_string(),
                 expert_panel: None,
+                expert_run: None,
+                execution_context: None,
             },
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
@@ -12085,6 +13228,8 @@ mod tests {
                         },
                     ],
                 }),
+                expert_run: None,
+                execution_context: None,
             },
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
@@ -12100,6 +13245,166 @@ mod tests {
         assert!(prompt.contains("基辛格（tenant:kissinger）"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn normalize_expert_panel_run_request_requires_one_question_or_source_message() {
+        let experts = vec![ExpertPanelExpert {
+            skill: "mearsheimer".to_string(),
+            scope: SkillScope::Workspace,
+            label: "米尔斯海默".to_string(),
+            description: None,
+        }];
+
+        let missing = normalize_expert_panel_run_request(ExpertPanelRunRequest {
+            question: None,
+            source_message_id: None,
+            knowledge_base_id: None,
+            auto_retrieval: None,
+            experts: experts.clone(),
+            retry_count: None,
+            concurrency_limit: None,
+        })
+        .expect_err("missing question/source should fail");
+        assert!(missing.contains("exactly one"));
+
+        let both = normalize_expert_panel_run_request(ExpertPanelRunRequest {
+            question: Some("问题".to_string()),
+            source_message_id: Some("msg-1".to_string()),
+            knowledge_base_id: None,
+            auto_retrieval: None,
+            experts,
+            retry_count: None,
+            concurrency_limit: None,
+        })
+        .expect_err("both question/source should fail");
+        assert!(both.contains("exactly one"));
+    }
+
+    #[test]
+    fn normalize_expert_panel_run_request_deserializes_legacy_payload() {
+        let request: ExpertPanelRunRequest = serde_json::from_value(json!({
+            "question": "Summarize the situation",
+            "experts": [{
+                "skill": "mearsheimer",
+                "scope": "workspace",
+                "label": "米尔斯海默"
+            }],
+            "retry_count": 2,
+            "concurrency_limit": 4
+        }))
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(request.question.as_deref(), Some("Summarize the situation"));
+        assert_eq!(request.source_message_id, None);
+        assert_eq!(request.retry_count, Some(2));
+        assert_eq!(request.concurrency_limit, Some(4));
+    }
+
+    #[test]
+    fn normalize_expert_panel_run_request_deserializes_execution_context_payload() {
+        let request: ExpertPanelRunRequest = serde_json::from_value(json!({
+            "question": "Summarize the situation",
+            "knowledge_base_id": "kb-123",
+            "auto_retrieval": false,
+            "experts": [{
+                "skill": "mearsheimer",
+                "scope": "workspace",
+                "label": "米尔斯海默"
+            }]
+        }))
+        .expect("execution context payload should deserialize");
+
+        assert_eq!(request.question.as_deref(), Some("Summarize the situation"));
+        assert_eq!(request.knowledge_base_id.as_deref(), Some("kb-123"));
+        assert_eq!(request.auto_retrieval, Some(false));
+    }
+
+    #[test]
+    fn normalize_expert_panel_run_request_defaults_and_caps_controls() {
+        let request = normalize_expert_panel_run_request(ExpertPanelRunRequest {
+            question: Some("问题".to_string()),
+            source_message_id: None,
+            experts: vec![ExpertPanelExpert {
+                skill: "mearsheimer".to_string(),
+                scope: SkillScope::Workspace,
+                label: "米尔斯海默".to_string(),
+                description: None,
+            }],
+            retry_count: Some(9),
+            concurrency_limit: Some(99),
+            knowledge_base_id: Some("  kb-strategy  ".to_string()),
+            auto_retrieval: Some(false),
+        })
+        .expect("valid request");
+
+        assert_eq!(request.retry_count, Some(3));
+        assert_eq!(request.concurrency_limit, Some(8));
+        assert_eq!(request.knowledge_base_id.as_deref(), Some("kb-strategy"));
+        assert_eq!(request.auto_retrieval, Some(false));
+    }
+
+    #[test]
+    fn snapshots_and_model_input_skip_thinking_blocks() {
+        let message = runtime::ConversationMessage::assistant(vec![
+            runtime::ContentBlock::Thinking {
+                thinking: "private chain of thought".to_string(),
+                signature: Some("sig-1".to_string()),
+            },
+            runtime::ContentBlock::Text {
+                text: "visible answer".to_string(),
+            },
+        ]);
+
+        let snapshot = super::message_snapshot("thread-1", 0, &message);
+        assert_eq!(snapshot.id, "thread-1-message-0");
+        assert_eq!(snapshot.blocks.len(), 1);
+        assert!(matches!(
+            &snapshot.blocks[0],
+            MessageBlockSnapshot::Text { text } if text == "visible answer"
+        ));
+
+        let input = super::convert_messages(&[message]);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].content.len(), 1);
+        assert!(matches!(
+            &input[0].content[0],
+            InputContentBlock::Text { text } if text == "visible answer"
+        ));
+    }
+
+    #[test]
+    fn source_message_text_resolves_snapshot_message_id() {
+        let thread = Arc::new(test_thread(Some("alice")));
+        {
+            let mut guard = thread
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.record.id = "thread-source".to_string();
+            guard
+                .session
+                .push_message(runtime::ConversationMessage::user_text("需要专家复盘的原始问题"))
+                .expect("append source message");
+            guard
+                .session
+                .push_message(runtime::ConversationMessage::assistant(vec![
+                    runtime::ContentBlock::Thinking {
+                        thinking: "private".to_string(),
+                        signature: None,
+                    },
+                ]))
+                .expect("append hidden-only message");
+        }
+
+        let snapshot = thread.snapshot();
+        assert_eq!(snapshot.messages[0].id, "thread-source-message-0");
+        assert_eq!(
+            super::resolve_source_message_text(&thread, "thread-source-message-0").as_deref(),
+            Some("需要专家复盘的原始问题")
+        );
+        assert!(super::resolve_source_message_text(&thread, "thread-source-message-1").is_none());
+        assert!(super::resolve_source_message_text(&thread, "other-thread-message-0").is_none());
     }
 
     #[test]
@@ -12132,6 +13437,8 @@ mod tests {
                 kind: RunKind::UserMessage,
                 prompt: "直接聊天".to_string(),
                 expert_panel: None,
+                expert_run: None,
+                execution_context: None,
             },
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
@@ -12174,6 +13481,8 @@ mod tests {
                             description: None,
                         }],
                     }),
+                    expert_run: None,
+                    execution_context: None,
                 },
             });
         }
@@ -12227,6 +13536,8 @@ mod tests {
                             description: None,
                         }],
                     }),
+                    expert_run: None,
+                    execution_context: None,
                 },
             });
         }
@@ -12281,6 +13592,8 @@ mod tests {
                             description: None,
                         }],
                     }),
+                    expert_run: None,
+                    execution_context: None,
                 },
             });
         }
@@ -12359,6 +13672,8 @@ mod tests {
                             description: None,
                         }],
                     }),
+                    expert_run: None,
+                    execution_context: None,
                 },
             });
         }
@@ -13196,6 +14511,8 @@ mod tests {
             Json(CommandRequest::UserMessage {
                 content: "请总结当前资料".to_string(),
                 expert_panel: None,
+                knowledge_base_id: None,
+                auto_retrieval: None,
             }),
         )
         .await
@@ -13293,6 +14610,8 @@ mod tests {
                         description: Some("评估结构性冲突".to_string()),
                     }],
                 }),
+                knowledge_base_id: Some("kb-panel-alpha".to_string()),
+                auto_retrieval: Some(false),
             }),
         )
         .await
@@ -13331,6 +14650,22 @@ mod tests {
             expert_panel.get("panel_id").and_then(Value::as_str),
             Some("expert-panel-xyz12345")
         );
+        let execution_context = payload
+            .get("execution_context")
+            .and_then(Value::as_object)
+            .expect("execution context audit payload");
+        assert_eq!(
+            execution_context
+                .get("knowledge_base_id")
+                .and_then(Value::as_str),
+            Some("kb-panel-alpha")
+        );
+        assert_eq!(
+            execution_context
+                .get("auto_retrieval")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
@@ -13362,6 +14697,8 @@ mod tests {
                     kind: RunKind::UserMessage,
                     prompt: "continue".to_string(),
                     expert_panel: None,
+                    expert_run: None,
+                    execution_context: None,
                 },
             }),
             pending_replan: None,
