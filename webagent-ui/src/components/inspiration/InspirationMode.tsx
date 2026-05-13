@@ -19,6 +19,7 @@ import { ModelDrawer } from "@/components/management/ModelDrawer";
 import { expertDisplayName } from "@/lib/clawd/expert-brainstorm";
 import { buildExpertRunRequest } from "@/lib/clawd/expert-runs";
 import { buildSourceRailModel } from "@/lib/clawd/source-model";
+import { buildTimelineEvents } from "@/lib/clawd/timeline-events";
 import { groupThreadsByProject } from "@/lib/clawd/thread-groups";
 import type { RichContent } from "@/components/rich-content/types";
 import { useClawdSession } from "@/hooks/useClawdSession";
@@ -209,6 +210,10 @@ export function InspirationMode({
     () => buildTimelineReferenceDetail(selectedThread, activeReferenceTarget),
     [activeReferenceTarget, selectedThread],
   );
+  const timelineEvents = useMemo(
+    () => buildTimelineEvents(selectedThread),
+    [selectedThread],
+  );
 
   const sourceRailModel = useMemo(
     () =>
@@ -358,11 +363,9 @@ export function InspirationMode({
         />
 
         <ChatPanel
-          activeReferenceDetail={activeReferenceDetail}
           error={error}
           loading={loading || threadLoading}
           messages={messages}
-          onCloseReferenceDetail={() => setActiveReferenceTarget(null)}
           onOpenReference={(target) => setActiveReferenceTarget(target)}
           onSendMessage={handleSendMessage}
           sending={sending || expertRun.running}
@@ -379,6 +382,7 @@ export function InspirationMode({
                 : null
           }
           threadTitle={selectedThread?.topic?.trim() || "灵感工作台"}
+          timelineEvents={timelineEvents}
         />
 
         <ExpertPanel

@@ -66,11 +66,13 @@ describe("InspirationMode", () => {
     expect(html).toContain("我的上传");
     expect(html).toContain("平台资料源");
     expect(html).toContain("当前资料范围");
+    expect(html).toContain("时间线");
     expect(html).not.toContain("上下文");
     expect(html).not.toContain("活动流");
     expect(html).not.toContain("数据驱动");
     expect(html).not.toContain("任务驱动");
     expect(html).not.toContain("分屏预设");
+    expect(html).not.toContain("转为任务");
     expect(html).not.toContain("workspace_root");
     expect(html).not.toContain("endpoint");
     expect(html).not.toContain("index_name");
