@@ -121,7 +121,9 @@ export type UseClawdSessionResult = {
     expertPanel?: ExpertPanelContext,
     executionContext?: {
       knowledgeBaseId?: string | null;
+      knowledge_base_id?: string | null;
       autoRetrieval?: boolean;
+      auto_retrieval?: boolean;
     },
   ) => Promise<ThreadSnapshot>;
   uploadFilesToPersonalSource: (files: File[]) => Promise<void>;
@@ -283,7 +285,9 @@ export function useClawdSession(auth: RequestAuth): UseClawdSessionResult {
       expertPanel?: ExpertPanelContext,
       executionContext?: {
         knowledgeBaseId?: string | null;
+        knowledge_base_id?: string | null;
         autoRetrieval?: boolean;
+        auto_retrieval?: boolean;
       },
     ): Promise<ThreadSnapshot> => {
       const trimmedContent = content.trim();
@@ -296,6 +300,14 @@ export function useClawdSession(auth: RequestAuth): UseClawdSessionResult {
 
       try {
         const threadId = selectedThreadId ?? (await createEmptyThread(trimmedContent)).id;
+        const knowledgeBaseId =
+          executionContext?.knowledge_base_id !== undefined
+            ? executionContext.knowledge_base_id
+            : executionContext?.knowledgeBaseId;
+        const autoRetrieval =
+          executionContext?.auto_retrieval !== undefined
+            ? executionContext.auto_retrieval
+            : executionContext?.autoRetrieval;
         const snapshot = await sendThreadCommand(
           threadId,
           expertPanel
@@ -303,21 +315,21 @@ export function useClawdSession(auth: RequestAuth): UseClawdSessionResult {
                 type: "user_message",
                 content: trimmedContent,
                 expert_panel: expertPanel,
-                ...(executionContext?.knowledgeBaseId
-                  ? { knowledge_base_id: executionContext.knowledgeBaseId }
+                ...(knowledgeBaseId !== undefined
+                  ? { knowledge_base_id: knowledgeBaseId }
                   : {}),
-                ...(executionContext?.autoRetrieval !== undefined
-                  ? { auto_retrieval: executionContext.autoRetrieval }
+                ...(autoRetrieval !== undefined
+                  ? { auto_retrieval: autoRetrieval }
                   : {}),
               }
             : {
                 type: "user_message",
                 content: trimmedContent,
-                ...(executionContext?.knowledgeBaseId
-                  ? { knowledge_base_id: executionContext.knowledgeBaseId }
+                ...(knowledgeBaseId !== undefined
+                  ? { knowledge_base_id: knowledgeBaseId }
                   : {}),
-                ...(executionContext?.autoRetrieval !== undefined
-                  ? { auto_retrieval: executionContext.autoRetrieval }
+                ...(autoRetrieval !== undefined
+                  ? { auto_retrieval: autoRetrieval }
                   : {}),
               },
           auth,

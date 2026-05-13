@@ -28,6 +28,7 @@ import { useThreadEvents } from "@/hooks/useThreadEvents";
 import type {
   AuthSession,
   ClawdConfig,
+  CreateExpertPanelRunRequest,
   RequestAuth,
   SkillSummary,
   ThreadSummary,
@@ -38,9 +39,70 @@ import { ExpertPanel } from "./ExpertPanel";
 import { HistoryPanel } from "./HistoryPanel";
 import { TimelineReferenceDetail } from "./TimelineReferenceDetail";
 
-type PendingExecutionScope = {
-  knowledgeBaseId: string | null;
-};
+export type PendingExecutionScope =
+  | {
+      kind: "select";
+      knowledgeBaseId: string;
+    }
+  | {
+      kind: "clear";
+    };
+
+export function buildExecutionContextPayload(
+  pendingScope: PendingExecutionScope | null,
+  autoRetrieval: boolean,
+): {
+  knowledge_base_id?: string | null;
+  auto_retrieval: boolean;
+} {
+  if (!pendingScope) {
+    return {
+      auto_retrieval: autoRetrieval,
+    };
+  }
+
+  if (pendingScope.kind === "clear") {
+    return {
+      knowledge_base_id: null,
+      auto_retrieval: autoRetrieval,
+    };
+  }
+
+  return {
+    knowledge_base_id: pendingScope.knowledgeBaseId,
+    auto_retrieval: autoRetrieval,
+  };
+}
+
+export function buildSourceContextLabel({
+  pendingScope,
+  pendingKnowledgeBaseName,
+  threadKnowledgeBaseName,
+  activeKnowledgeBaseName,
+}: {
+  pendingScope: PendingExecutionScope | null;
+  pendingKnowledgeBaseName: string | null;
+  threadKnowledgeBaseName: string | null;
+  activeKnowledgeBaseName: string | null;
+}): string | null {
+  if (pendingScope?.kind === "clear") {
+    return "下一条消息或专家会诊将不使用资料范围";
+  }
+
+  if (pendingKnowledgeBaseName) {
+    return `下一条消息或专家会诊将使用：${pendingKnowledgeBaseName}`;
+  }
+
+  if (threadKnowledgeBaseName) {
+    return `当前线程资料范围：${threadKnowledgeBaseName}`;
+  }
+
+  if (activeKnowledgeBaseName) {
+    return `下一条消息或专家会诊将使用：${activeKnowledgeBaseName}`;
+  }
+
+  return null;
+}
 
 interface InspirationModeProps {
   auth: RequestAuth;
@@ -237,7 +299,7 @@ export function InspirationMode({
   );
   const pendingKnowledgeBase = useMemo(
     () =>
-      pendingExecutionScope?.knowledgeBaseId
+      pendingExecutionScope?.kind === "select"
         ? knowledgeBases.find((item) => item.id === pendingExecutionScope.knowledgeBaseId) ?? null
         : null,
     [knowledgeBases, pendingExecutionScope],
@@ -267,11 +329,12 @@ export function InspirationMode({
         const snapshot = await createEmptyThread(content, browserModelConfig);
         threadId = snapshot.id;
       }
-      await expertRun.start(
-        buildExpertRunRequest({
+      const expertRunRequest: CreateExpertPanelRunRequest = buildExpertRunRequest({
           question: content,
-          knowledgeBaseId: pendingExecutionScope?.knowledgeBaseId ?? undefined,
-          autoRetrieval,
+          knowledgeBaseId:
+            pendingExecutionScope?.kind === "select"
+              ? pendingExecutionScope.knowledgeBaseId
+              : undefined,
           experts: selectedExperts.map((expert) => ({
             skill: expert.skill.name,
             scope: expert.skill.scope,
@@ -280,17 +343,22 @@ export function InspirationMode({
           })),
           retryCount,
           concurrencyLimit,
-        }),
+          autoRetrieval,
+        });
+      await expertRun.start(
+        pendingExecutionScope?.kind === "clear"
+          ? {
+              ...expertRunRequest,
+              knowledge_base_id: null,
+            }
+          : expertRunRequest,
         threadId,
       );
       setPendingExecutionScope(null);
       return;
     }
 
-    await sendUserMessage(content, undefined, {
-      knowledgeBaseId: pendingExecutionScope?.knowledgeBaseId,
-      autoRetrieval,
-    });
+    await sendUserMessage(content, undefined, buildExecutionContextPayload(pendingExecutionScope, autoRetrieval));
     setPendingExecutionScope(null);
   };
 
@@ -312,7 +380,11 @@ export function InspirationMode({
 
   const handleSelectKnowledgeBase = (knowledgeBaseId: string | null) => {
     selectKnowledgeBase(knowledgeBaseId);
-    setPendingExecutionScope({ knowledgeBaseId });
+    setPendingExecutionScope(
+      knowledgeBaseId
+        ? { kind: "select", knowledgeBaseId }
+        : { kind: "clear" },
+    );
   };
 
   const handleResetBrowserModel = () => {
@@ -400,13 +472,12 @@ export function InspirationMode({
               : null
           }
           sourceContextLabel={
-            pendingKnowledgeBase
-              ? `下一条消息或专家会诊将使用：${pendingKnowledgeBase.name}`
-              : selectedThread?.knowledge_base_name
-                ? `当前线程资料范围：${selectedThread.knowledge_base_name}`
-                : activeKnowledgeBase
-                  ? `下一条消息或专家会诊将使用：${activeKnowledgeBase.name}`
-                : null
+            buildSourceContextLabel({
+              pendingScope: pendingExecutionScope,
+              pendingKnowledgeBaseName: pendingKnowledgeBase?.name ?? null,
+              threadKnowledgeBaseName: selectedThread?.knowledge_base_name ?? null,
+              activeKnowledgeBaseName: activeKnowledgeBase?.name ?? null,
+            })
           }
           threadTitle={selectedThread?.topic?.trim() || "灵感工作台"}
           timelineEvents={timelineEvents}
