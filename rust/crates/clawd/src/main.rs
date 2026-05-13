@@ -730,6 +730,11 @@ enum PostgresRequest {
         limit: usize,
         reply: mpsc::Sender<Result<Vec<AuditRecord>, String>>,
     },
+    LoadLatestExpertPanelRunState {
+        thread_id: String,
+        run_id: String,
+        reply: mpsc::Sender<Result<Option<ExpertPanelRunResponse>, String>>,
+    },
     LoadMemoryNotesForScope {
         record: ThreadRecord,
         scope: MemorySearchScope,
@@ -932,6 +937,20 @@ impl PostgresWorker {
                     } => {
                         let result = runtime
                             .block_on(load_postgres_audit_records(&client, &thread_id, limit))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::LoadLatestExpertPanelRunState {
+                        thread_id,
+                        run_id,
+                        reply,
+                    } => {
+                        let result = runtime
+                            .block_on(load_postgres_latest_expert_panel_run_state(
+                                &client,
+                                &thread_id,
+                                &run_id,
+                            ))
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);
                     }
@@ -1272,6 +1291,25 @@ impl PostgresWorker {
             .send(PostgresRequest::LoadAuditRecords {
                 thread_id: thread_id.to_string(),
                 limit,
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    fn load_latest_expert_panel_run_state(
+        &self,
+        thread_id: &str,
+        run_id: &str,
+    ) -> Result<Option<ExpertPanelRunResponse>, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::LoadLatestExpertPanelRunState {
+                thread_id: thread_id.to_string(),
+                run_id: run_id.to_string(),
                 reply: reply_tx,
             })
             .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
@@ -1851,6 +1889,22 @@ impl ThreadStore {
                 load_sqlite_audit_records(&guard, thread_id, limit)
             }
             Self::Postgres { worker, .. } => worker.load_audit_records(thread_id, limit),
+        }
+    }
+
+    fn load_latest_expert_panel_run_state(
+        &self,
+        thread_id: &str,
+        run_id: &str,
+    ) -> Result<Option<ExpertPanelRunResponse>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                load_sqlite_latest_expert_panel_run_state(&guard, thread_id, run_id)
+            }
+            Self::Postgres { worker, .. } => worker.load_latest_expert_panel_run_state(thread_id, run_id),
         }
     }
 
@@ -2513,6 +2567,28 @@ fn load_sqlite_audit_records(
         });
     }
     Ok(records)
+}
+
+fn load_sqlite_latest_expert_panel_run_state(
+    connection: &SqliteConnection,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<Option<ExpertPanelRunResponse>, Box<dyn std::error::Error>> {
+    let mut statement = connection.prepare(
+        "SELECT payload_json
+         FROM audit_records
+         WHERE thread_id = ?1 AND kind = 'expert_panel_run_state'
+         ORDER BY created_at_ms DESC, id DESC",
+    )?;
+    let rows = statement.query_map([thread_id], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let payload_json = row?;
+        let response = serde_json::from_str::<ExpertPanelRunResponse>(&payload_json)?;
+        if response.run_id == run_id {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
 }
 
 fn upsert_sqlite_api_key(
@@ -3739,6 +3815,30 @@ async fn load_postgres_audit_records(
             })
         })
         .collect()
+}
+
+async fn load_postgres_latest_expert_panel_run_state(
+    client: &PostgresClient,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<Option<ExpertPanelRunResponse>, Box<dyn std::error::Error>> {
+    let rows = client
+        .query(
+            "SELECT payload_json
+             FROM audit_records
+             WHERE thread_id = $1 AND kind = 'expert_panel_run_state'
+             ORDER BY created_at_ms DESC, id DESC",
+            &[&thread_id],
+        )
+        .await?;
+    for row in rows {
+        let payload_json: String = row.get(0);
+        let response = serde_json::from_str::<ExpertPanelRunResponse>(&payload_json)?;
+        if response.run_id == run_id {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
 }
 
 struct ManagedThread {
@@ -7632,7 +7732,7 @@ async fn get_expert_panel_run(
         AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
     })?;
     ensure_thread_access(&thread, &auth)?;
-    let response = expert_run_response_from_audit(&thread, &run_id).ok_or_else(|| {
+    let response = load_expert_run_response(&state, &thread, &run_id)?.ok_or_else(|| {
         AppError::new(
             StatusCode::NOT_FOUND,
             format!("expert panel run not found: {run_id}"),
@@ -7656,7 +7756,7 @@ async fn expert_panel_run_events(
         AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
     })?;
     ensure_thread_access(&thread, &auth)?;
-    let initial = expert_run_response_from_audit(&thread, &run_id).ok_or_else(|| {
+    let initial = load_expert_run_response(&state, &thread, &run_id)?.ok_or_else(|| {
         AppError::new(
             StatusCode::NOT_FOUND,
             format!("expert panel run not found: {run_id}"),
@@ -8584,7 +8684,7 @@ fn execute_expert_panel_run(
         })?;
     let effective_record = effective_record_for_run(&record, execution_context.as_ref());
 
-    let mut panel_state = expert_run_response_from_audit(&thread, &controls.run_id)
+    let mut panel_state = load_expert_run_response_or_log(&state, &thread, &controls.run_id)
         .unwrap_or_else(|| expert_run_initial_response(&record.id, &controls.run_id, &ExpertPanelRunRequest {
             question: Some(request.prompt.clone()),
             source_message_id: None,
@@ -8708,7 +8808,7 @@ fn execute_expert_panel_run(
         },
     )?;
 
-    if let Some(mut final_state) = expert_run_response_from_audit(&thread, &controls.run_id) {
+    if let Some(mut final_state) = load_expert_run_response_or_log(&state, &thread, &controls.run_id) {
         final_state.status = if successes.is_empty() && !failures.is_empty() {
             ExpertPanelRunStatus::Failed
         } else {
@@ -12098,15 +12198,101 @@ fn expert_run_response_from_audit(
         .audit_records
         .iter()
         .rev()
-        .find(|record| {
-            record.kind == "expert_panel_run_state"
-                && record
-                    .payload
-                    .get("run_id")
-                    .and_then(Value::as_str)
-                    == Some(run_id)
-        })
-        .and_then(|record| serde_json::from_value(record.payload.clone()).ok())
+        .find_map(|record| expert_run_response_from_record(record, run_id))
+}
+
+fn expert_run_response_from_record(
+    record: &AuditRecord,
+    run_id: &str,
+) -> Option<ExpertPanelRunResponse> {
+    if record.kind != "expert_panel_run_state" {
+        return None;
+    }
+    let response = serde_json::from_value::<ExpertPanelRunResponse>(record.payload.clone()).ok()?;
+    if response.run_id == run_id {
+        Some(response)
+    } else {
+        None
+    }
+}
+
+fn expert_run_status_rank(status: ExpertPanelRunStatus) -> u8 {
+    match status {
+        ExpertPanelRunStatus::Queued => 0,
+        ExpertPanelRunStatus::Running => 1,
+        ExpertPanelRunStatus::Succeeded | ExpertPanelRunStatus::Failed => 2,
+    }
+}
+
+fn expert_run_response_supersedes(
+    existing: &ExpertPanelRunResponse,
+    candidate: &ExpertPanelRunResponse,
+) -> bool {
+    let existing_rank = expert_run_status_rank(existing.status);
+    let candidate_rank = expert_run_status_rank(candidate.status);
+    if candidate_rank != existing_rank {
+        return candidate_rank > existing_rank;
+    }
+    for (existing_expert, candidate_expert) in existing.experts.iter().zip(candidate.experts.iter()) {
+        let existing_expert_rank = expert_run_status_rank(match existing_expert.status {
+            ExpertPanelExpertStatus::Queued => ExpertPanelRunStatus::Queued,
+            ExpertPanelExpertStatus::Running | ExpertPanelExpertStatus::Retrying => ExpertPanelRunStatus::Running,
+            ExpertPanelExpertStatus::Succeeded => ExpertPanelRunStatus::Succeeded,
+            ExpertPanelExpertStatus::Failed => ExpertPanelRunStatus::Failed,
+        });
+        let candidate_expert_rank = expert_run_status_rank(match candidate_expert.status {
+            ExpertPanelExpertStatus::Queued => ExpertPanelRunStatus::Queued,
+            ExpertPanelExpertStatus::Running | ExpertPanelExpertStatus::Retrying => ExpertPanelRunStatus::Running,
+            ExpertPanelExpertStatus::Succeeded => ExpertPanelRunStatus::Succeeded,
+            ExpertPanelExpertStatus::Failed => ExpertPanelRunStatus::Failed,
+        });
+        if candidate_expert_rank != existing_expert_rank {
+            return candidate_expert_rank > existing_expert_rank;
+        }
+        if candidate_expert.attempts != existing_expert.attempts {
+            return candidate_expert.attempts > existing_expert.attempts;
+        }
+        let existing_has_detail = existing_expert.content.is_some() || existing_expert.error.is_some();
+        let candidate_has_detail = candidate_expert.content.is_some() || candidate_expert.error.is_some();
+        if existing_has_detail != candidate_has_detail {
+            return candidate_has_detail;
+        }
+    }
+    false
+}
+
+fn load_expert_run_response(
+    state: &Arc<AppState>,
+    thread: &Arc<ManagedThread>,
+    run_id: &str,
+) -> Result<Option<ExpertPanelRunResponse>, AppError> {
+    if let Some(response) = expert_run_response_from_audit(thread, run_id) {
+        return Ok(Some(response));
+    }
+    let thread_id = thread.id().to_string();
+    state
+        .store
+        .load_latest_expert_panel_run_state(&thread_id, run_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+fn load_expert_run_response_or_log(
+    state: &Arc<AppState>,
+    thread: &Arc<ManagedThread>,
+    run_id: &str,
+) -> Option<ExpertPanelRunResponse> {
+    match load_expert_run_response(state, thread, run_id) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!(
+                "failed to load expert panel run state for thread {} run {}: {}",
+                thread.id(),
+                run_id,
+                error.message,
+            );
+            None
+        }
+    }
 }
 
 fn persist_expert_run_state(
@@ -12114,6 +12300,11 @@ fn persist_expert_run_state(
     thread: &Arc<ManagedThread>,
     response: &ExpertPanelRunResponse,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(existing) = load_expert_run_response_or_log(state, thread, &response.run_id) {
+        if !expert_run_response_supersedes(&existing, response) {
+            return Ok(());
+        }
+    }
     append_thread_audit(
         &state.store,
         thread,
@@ -12520,13 +12711,14 @@ fn normalize_terms(text: &str) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::fs;
     use std::ffi::OsString;
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::sync::{Mutex, Mutex as StdMutex, OnceLock, RwLock};
     use std::thread;
 
     use axum::extract::{Query, State};
@@ -12548,14 +12740,16 @@ mod tests {
         provider_client_from_record, provider_kind_for_model_access, request_model_for_model_access,
         ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord, AuditRecord, AuthContext, AuthMode,
         CapacityUsage, CommandRequest, DataSourceKind, DataSourceRecord, EsConfig,
-        ExpertPanelRunRequest,
+        ExpertPanelRunExpertState, ExpertPanelRunRequest, ExpertPanelRunResponse, ExpertPanelRunStatus,
         KnowledgeBaseRecord, ManagedThread, MemoryNote, MemoryScope, MemorySearchScope,
         MessageBlockSnapshot, ModelAccessConfig, MutationRateLimiter, MutationRateUsage,
         ProjectRecord, ProviderKind, ResolvedDataAccess, ResolvedDbAccess,
         ResolvedDocumentAccess, ResolvedWebAccess, RunKind, RunRequest, SkillScope,
         ThreadRecord, ThreadState, ThreadStatus, ThreadStore, UpdateProjectRequest,
-        CURRENT_DATABASE_SCHEMA_VERSION, post_thread_command,
-        ExpertPanelExpert, ExpertPanelRequest, execute_artifact_emit, execute_expert_panel_emit,
+        CURRENT_DATABASE_SCHEMA_VERSION, MAX_VISIBLE_AUDIT_RECORDS, append_thread_audit,
+        expert_run_response_from_audit, get_expert_panel_run, persist_expert_run_state,
+        post_thread_command, ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest,
+        execute_artifact_emit, execute_expert_panel_emit,
     };
     use api::InputContentBlock;
     use crate::{create_expert_panel_run, create_thread, AuthQuery, CreateThreadRequest};
@@ -14991,6 +15185,76 @@ mod tests {
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
 
+    #[test]
+    fn persist_expert_run_state_does_not_overwrite_newer_state() {
+        let temp_dir = test_temp_dir("expert-panel-state-ordering");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let store = Arc::new(ThreadStore::open(&config).expect("open sqlite store"));
+        let record = test_record(&temp_dir, Some("alice"));
+        fs::create_dir_all(&record.workspace_root).expect("create workspace");
+
+        let session = Session::new()
+            .with_workspace_root(record.workspace_root.clone())
+            .with_persistence_path(record.session_path.clone());
+        let thread = Arc::new(ManagedThread::new(ThreadState {
+            record: record.clone(),
+            visible_memory_notes: record.memory_notes.clone(),
+            audit_records: Vec::new(),
+            session,
+            status: ThreadStatus::Idle,
+            last_error: None,
+            draft_assistant_text: String::new(),
+            next_run_id: 1,
+            current_run: None,
+            pending_replan: None,
+        }));
+        persist_thread_state(&thread, &store).expect("persist thread");
+
+        let state = Arc::new(AppState {
+            config,
+            store,
+            admission: Mutex::new(()),
+            mutation_rate_limiter: Mutex::new(MutationRateLimiter::default()),
+            threads: RwLock::new(HashMap::new()),
+        });
+
+        let queued = ExpertPanelRunResponse {
+            run_id: "expert-run-stale".to_string(),
+            thread_id: record.id.clone(),
+            status: ExpertPanelRunStatus::Queued,
+            retry_count: 1,
+            concurrency_limit: 1,
+            experts: vec![ExpertPanelRunExpertState {
+                skill: "mearsheimer".to_string(),
+                scope: SkillScope::Workspace,
+                label: "米尔斯海默".to_string(),
+                description: None,
+                status: ExpertPanelExpertStatus::Queued,
+                attempts: 0,
+                content: None,
+                citations: Vec::new(),
+                confidence: None,
+                stance: None,
+                error: None,
+            }],
+        };
+        let mut running = queued.clone();
+        running.status = ExpertPanelRunStatus::Running;
+        running.experts[0].status = ExpertPanelExpertStatus::Running;
+        running.experts[0].attempts = 1;
+
+        persist_expert_run_state(&state, &thread, &running).expect("persist running state");
+        persist_expert_run_state(&state, &thread, &queued).expect("persist stale queued state");
+
+        let resolved = expert_run_response_from_audit(&thread, &queued.run_id)
+            .expect("resolve latest expert run state");
+        assert_eq!(resolved.status, ExpertPanelRunStatus::Running);
+        assert_eq!(resolved.experts[0].status, ExpertPanelExpertStatus::Running);
+        assert_eq!(resolved.experts[0].attempts, 1);
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
     #[tokio::test]
     async fn expert_panel_run_uses_override_execution_context_for_expert_turns() {
         let temp_dir = test_temp_dir("expert-panel-override-context");
@@ -15226,6 +15490,92 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(audit_ids, vec!["audit-1", "audit-2"]);
         assert_eq!(snapshot.audit_records[1].kind, "tool_result");
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn get_expert_panel_run_loads_persisted_state_outside_visible_audit_window() {
+        let temp_dir = test_temp_dir("expert-panel-persisted-lookup");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let workspace_root = temp_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let state = Arc::new(AppState::new(config).expect("create app state"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
+
+        let created = create_thread(
+            State(state.clone()),
+            headers.clone(),
+            Query(AuthQuery::default()),
+            Json(CreateThreadRequest {
+                workspace_root: Some(workspace_root.display().to_string()),
+                project_id: None,
+                knowledge_base_id: None,
+                model: None,
+                model_base_url: None,
+                model_api_key: None,
+                permission_mode: None,
+                topic: Some("expert panel durability".to_string()),
+            }),
+        )
+        .await
+        .expect("create thread")
+        .0;
+
+        let thread = state.get_thread(&created.id).expect("thread exists");
+        let response = ExpertPanelRunResponse {
+            run_id: "expert-run-persisted".to_string(),
+            thread_id: created.id.clone(),
+            status: ExpertPanelRunStatus::Succeeded,
+            retry_count: 2,
+            concurrency_limit: 1,
+            experts: vec![ExpertPanelRunExpertState {
+                skill: "mearsheimer".to_string(),
+                scope: SkillScope::Workspace,
+                label: "米尔斯海默".to_string(),
+                description: None,
+                status: ExpertPanelExpertStatus::Succeeded,
+                attempts: 2,
+                content: Some("captured synthesis".to_string()),
+                citations: Vec::new(),
+                confidence: None,
+                stance: None,
+                error: None,
+            }],
+        };
+        persist_expert_run_state(&state, &thread, &response).expect("persist expert run state");
+
+        for index in 0..=MAX_VISIBLE_AUDIT_RECORDS {
+            append_thread_audit(
+                &state.store,
+                &thread,
+                "tool_result",
+                Some(1),
+                json!({ "index": index }),
+            )
+            .expect("append filler audit");
+        }
+
+        let snapshot = thread.snapshot();
+        assert!(!snapshot.audit_records.iter().any(|record| {
+            record.kind == "expert_panel_run_state"
+                && record.payload.get("run_id").and_then(Value::as_str)
+                    == Some(response.run_id.as_str())
+        }));
+
+        let loaded = get_expert_panel_run(
+            State(state.clone()),
+            headers.clone(),
+            Query(AuthQuery::default()),
+            axum::extract::Path((created.id.clone(), response.run_id.clone())),
+        )
+        .await
+        .expect("load persisted expert panel run")
+        .0;
+        assert_eq!(loaded.status, ExpertPanelRunStatus::Succeeded);
+        assert_eq!(loaded.experts[0].content.as_deref(), Some("captured synthesis"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
