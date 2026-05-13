@@ -38,6 +38,10 @@ import { ExpertPanel } from "./ExpertPanel";
 import { HistoryPanel } from "./HistoryPanel";
 import { TimelineReferenceDetail } from "./TimelineReferenceDetail";
 
+type PendingExecutionScope = {
+  knowledgeBaseId: string | null;
+};
+
 interface InspirationModeProps {
   auth: RequestAuth;
   authSession: AuthSession;
@@ -158,6 +162,7 @@ export function InspirationMode({
   const [retryCount, setRetryCount] = useState(1);
   const [concurrencyLimit, setConcurrencyLimit] = useState(3);
   const [autoRetrieval, setAutoRetrieval] = useState(true);
+  const [pendingExecutionScope, setPendingExecutionScope] = useState<PendingExecutionScope | null>(null);
   const [activeReferenceTarget, setActiveReferenceTarget] = useState<TimelineReferenceTarget | null>(null);
   const [browserModelConfig, setBrowserModelConfig] = useState<BrowserModelConfig>({
     baseUrl: "",
@@ -230,6 +235,13 @@ export function InspirationMode({
     () => knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null,
     [knowledgeBases, selectedKnowledgeBaseId],
   );
+  const pendingKnowledgeBase = useMemo(
+    () =>
+      pendingExecutionScope?.knowledgeBaseId
+        ? knowledgeBases.find((item) => item.id === pendingExecutionScope.knowledgeBaseId) ?? null
+        : null,
+    [knowledgeBases, pendingExecutionScope],
+  );
 
   const selectedExperts = useMemo(
     () => experts.filter((expert) => expert.selected),
@@ -258,6 +270,8 @@ export function InspirationMode({
       await expertRun.start(
         buildExpertRunRequest({
           question: content,
+          knowledgeBaseId: pendingExecutionScope?.knowledgeBaseId ?? undefined,
+          autoRetrieval,
           experts: selectedExperts.map((expert) => ({
             skill: expert.skill.name,
             scope: expert.skill.scope,
@@ -269,10 +283,15 @@ export function InspirationMode({
         }),
         threadId,
       );
+      setPendingExecutionScope(null);
       return;
     }
 
-    await sendUserMessage(content);
+    await sendUserMessage(content, undefined, {
+      knowledgeBaseId: pendingExecutionScope?.knowledgeBaseId,
+      autoRetrieval,
+    });
+    setPendingExecutionScope(null);
   };
 
   const handleToggleExpert = (id: string) => {
@@ -289,6 +308,11 @@ export function InspirationMode({
 
   const handleCreateDiscussion = async () => {
     await createEmptyThread(undefined, browserModelConfig);
+  };
+
+  const handleSelectKnowledgeBase = (knowledgeBaseId: string | null) => {
+    selectKnowledgeBase(knowledgeBaseId);
+    setPendingExecutionScope({ knowledgeBaseId });
   };
 
   const handleResetBrowserModel = () => {
@@ -358,7 +382,7 @@ export function InspirationMode({
             count: group.threadCount,
           }))}
           onCreateDiscussion={handleCreateDiscussion}
-          onSelectKnowledgeBase={selectKnowledgeBase}
+          onSelectKnowledgeBase={handleSelectKnowledgeBase}
           onSelectDiscussion={selectThread}
           onUploadFiles={handleUploadFiles}
         />
@@ -376,10 +400,12 @@ export function InspirationMode({
               : null
           }
           sourceContextLabel={
-            selectedThread?.knowledge_base_name
-              ? `当前连接资料空间：${selectedThread.knowledge_base_name}`
-              : activeKnowledgeBase
-                ? `下一次新建会话将连接：${activeKnowledgeBase.name}`
+            pendingKnowledgeBase
+              ? `下一条消息或专家会诊将使用：${pendingKnowledgeBase.name}`
+              : selectedThread?.knowledge_base_name
+                ? `当前线程资料范围：${selectedThread.knowledge_base_name}`
+                : activeKnowledgeBase
+                  ? `下一条消息或专家会诊将使用：${activeKnowledgeBase.name}`
                 : null
           }
           threadTitle={selectedThread?.topic?.trim() || "灵感工作台"}

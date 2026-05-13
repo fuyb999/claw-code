@@ -211,6 +211,9 @@ export function HistoryPanel({
               ? `${sourceModel.currentScope.label} · ${sourceModel.currentScope.dataSourceCount} 个来源`
               : "未限定资料范围"}
           </p>
+          <p className="mt-1 text-[10px] text-muted-foreground/60">
+            下一条消息或专家会诊将使用这里选择的资料范围。
+          </p>
         </div>
 
         <div className="mb-2 flex items-center justify-between shrink-0">
@@ -232,7 +235,7 @@ export function HistoryPanel({
           </label>
         </div>
         <p className="mb-2 shrink-0 text-[10px] text-muted-foreground/60">
-          点击来源会切换到它所属的资料范围。
+          点击来源会切换资料范围，用于下一条消息或专家会诊。
         </p>
         <SourceList
           emptyLabel="还没有上传资料"

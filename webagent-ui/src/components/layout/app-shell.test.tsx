@@ -66,6 +66,7 @@ describe("InspirationMode", () => {
     expect(html).toContain("我的上传");
     expect(html).toContain("平台资料源");
     expect(html).toContain("当前资料范围");
+    expect(html).toContain("下一条消息或专家会诊将使用这里选择的资料范围。");
     expect(html).toContain("时间线");
     expect(html).toContain("自动检索");
     expect(html).not.toContain("上下文");
@@ -138,7 +139,7 @@ describe("InspirationMode", () => {
 
     expect(html).toContain("市场资料包");
     expect(html).toContain("政策资料库");
-    expect(html).toContain("点击来源会切换到它所属的资料范围。");
+    expect(html).toContain("点击来源会切换资料范围，用于下一条消息或专家会诊。");
     expect(html).not.toContain("endpoint");
     expect(html).not.toContain("index_name");
     expect(html).not.toContain("internal-es");
