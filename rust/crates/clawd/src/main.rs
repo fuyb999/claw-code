@@ -12,8 +12,8 @@ pub mod agent_turns;
 
 use crate::agent_turns::{
     encode_ag_ui_sse_frame, AgUiEvent, AgentCitation, AgentConversationRecord,
-    AgentConversationStatus, AgentToolUpdates, AgentTurnDebugEvent, AgentTurnRecord,
-    AgentTurnStatus, AgentTurnStep, AgentTurnStepKind, AgentTurnStepStatus,
+    AgentConversationStatus, AgentToolUpdates, AgentTurnDebugEvent, AgentTurnError,
+    AgentTurnRecord, AgentTurnStatus, AgentTurnStep, AgentTurnStepKind, AgentTurnStepStatus,
 };
 use api::{
     model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
@@ -7859,6 +7859,103 @@ async fn list_agent_turns(
     Ok(Json(turns))
 }
 
+fn agent_conversation_for_auth(
+    state: &AppState,
+    auth: &AuthContext,
+    conversation_id: &str,
+) -> Result<AgentConversationRecord, AppError> {
+    state
+        .store
+        .list_agent_conversations(auth.tenant_id.as_deref(), &auth.user_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "conversation not found"))
+}
+
+fn create_agent_runtime_thread(
+    state: &AppState,
+    auth: &AuthContext,
+    conversation: &AgentConversationRecord,
+) -> Result<Arc<ManagedThread>, AppError> {
+    let workspace_root = state
+        .config
+        .managed_workspace_root(auth.tenant_id.as_deref(), &auth.user_id);
+    fs::create_dir_all(&workspace_root).map_err(|error| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create managed runtime workspace: {error}"),
+        )
+    })?;
+    let workspace_root = workspace_root.canonicalize().map_err(|error| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to prepare managed runtime workspace: {error}"),
+        )
+    })?;
+    let store = SessionStore::from_data_dir(&state.config.data_dir, &workspace_root)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut session = Session::new().with_workspace_root(workspace_root.clone());
+    let handle = store.create_handle(&session.session_id);
+    session = session.with_persistence_path(handle.path.clone());
+    session
+        .save_to_path(&handle.path)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let model_profile = conversation
+        .model_profile_id
+        .as_deref()
+        .map(|project_id| {
+            state.store.get_project(project_id).map_err(|error| {
+                AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            })
+        })
+        .transpose()?
+        .flatten();
+
+    let record = ThreadRecord {
+        id: format!("agent-runtime-{}", conversation.id),
+        tenant_id: conversation.tenant_id.clone(),
+        owner_id: Some(conversation.owner_id.clone()),
+        workspace_root,
+        session_path: handle.path,
+        project_id: conversation.model_profile_id.clone(),
+        project_name: None,
+        knowledge_base_id: conversation.selected_knowledge_base_ids.first().cloned(),
+        knowledge_base_name: None,
+        model: model_profile
+            .as_ref()
+            .and_then(|project| project.default_model.clone())
+            .unwrap_or_else(|| state.config.default_model.clone()),
+        model_access: model_profile
+            .as_ref()
+            .map(|project| project.model_access.clone())
+            .unwrap_or_default(),
+        permission_mode: PermissionMode::ReadOnly.as_str().to_string(),
+        topic: Some(conversation.title.clone()),
+        instructions: None,
+        preferred_skill_names: conversation.selected_expert_ids.clone(),
+        memory_notes: Vec::new(),
+        artifacts: Vec::new(),
+        created_at_ms: now_millis(),
+        updated_at_ms: now_millis(),
+        last_status: Some(ThreadStatus::Idle),
+        last_error: None,
+        next_run_id: 1,
+    };
+    Ok(Arc::new(ManagedThread::new(ThreadState {
+        record,
+        visible_memory_notes: Vec::new(),
+        audit_records: Vec::new(),
+        session,
+        status: ThreadStatus::Idle,
+        last_error: None,
+        draft_assistant_text: String::new(),
+        next_run_id: 1,
+        current_run: None,
+        pending_replan: None,
+    })))
+}
+
 async fn post_ag_ui_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -7866,6 +7963,19 @@ async fn post_ag_ui_run(
     Json(request): Json<AgUiRunRequest>,
 ) -> Result<Response, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
+    let conversation = agent_conversation_for_auth(&state, &auth, &request.thread_id)?;
+    if !extract_ag_ui_forwarded_tool_updates(&request).is_empty() {
+        return post_forwarded_ag_ui_run(state, auth, request);
+    }
+
+    post_runtime_ag_ui_run(state, auth, conversation, request)
+}
+
+fn post_forwarded_ag_ui_run(
+    state: Arc<AppState>,
+    auth: AuthContext,
+    request: AgUiRunRequest,
+) -> Result<Response, AppError> {
     let now = now_millis();
     let user_message = extract_ag_ui_user_message(&request).unwrap_or_else(|| "新问题".to_string());
     let assistant_text = "执行过程已开始，正在持续返回结果。".to_string();
@@ -7967,6 +8077,181 @@ async fn post_ag_ui_run(
             yield Ok::<Event, std::convert::Infallible>(
                 Event::default().data(data.trim_start_matches("data: ").trim_end()),
             );
+        }
+    };
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+fn post_runtime_ag_ui_run(
+    state: Arc<AppState>,
+    auth: AuthContext,
+    conversation: AgentConversationRecord,
+    request: AgUiRunRequest,
+) -> Result<Response, AppError> {
+    let now = now_millis();
+    let user_message = extract_ag_ui_user_message(&request).unwrap_or_else(|| "新问题".to_string());
+    let turn_id = if request.run_id.trim().is_empty() {
+        generate_id("turn")
+    } else {
+        request.run_id.trim().to_string()
+    };
+    let message_id = format!("{turn_id}-assistant");
+    let record = AgentTurnRecord {
+        id: turn_id.clone(),
+        conversation_id: conversation.id.clone(),
+        tenant_id: auth.tenant_id.clone(),
+        owner_id: auth.user_id.clone(),
+        user_message: user_message.clone(),
+        assistant_text: String::new(),
+        status: AgentTurnStatus::Running,
+        started_at_ms: now,
+        completed_at_ms: None,
+        steps: Vec::new(),
+        citations: Vec::new(),
+        expert_results: Vec::new(),
+        artifacts: Vec::new(),
+        error: None,
+        debug_events: Vec::new(),
+    };
+    state
+        .store
+        .upsert_agent_turn(&record)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let thread = create_agent_runtime_thread(&state, &auth, &conversation)?;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AgUiEvent>();
+    let sink = AgentRunEventSink {
+        turn_id: turn_id.clone(),
+        message_id: message_id.clone(),
+        sender,
+        store: state.store.clone(),
+        record: Arc::new(Mutex::new(record)),
+    };
+    let run_request = RunRequest {
+        kind: RunKind::UserMessage,
+        prompt: user_message,
+        expert_panel: None,
+        expert_run: None,
+        execution_context: Some(RunExecutionContext {
+            knowledge_base_id: conversation.selected_knowledge_base_ids.first().cloned(),
+            data_source_ids: if conversation.selected_data_source_ids.is_empty() {
+                None
+            } else {
+                Some(conversation.selected_data_source_ids.clone())
+            },
+            knowledge_base_name: None,
+            auto_retrieval: Some(true),
+        }),
+    };
+    {
+        let mut guard = thread
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.current_run = Some(ActiveRun {
+            run_id: 1,
+            abort_signal: HookAbortSignal::new(),
+            request: run_request,
+        });
+        guard.status = ThreadStatus::Running;
+        guard.record.updated_at_ms = now_millis();
+    }
+
+    let sink_for_task = sink.clone();
+    let thread_for_task = thread.clone();
+    let state_for_task = state.clone();
+    let thread_id = conversation.id.clone();
+    let run_id = turn_id.clone();
+    let message_id_for_task = message_id.clone();
+    tokio::spawn(async move {
+        sink_for_task.send(AgUiEvent::run_started(&thread_id, &run_id, now_millis()));
+        sink_for_task.send(AgUiEvent::TextMessageStart {
+            message_id: message_id_for_task.clone(),
+            role: "assistant".to_string(),
+            timestamp: now_millis(),
+        });
+        let result = tokio::task::spawn_blocking({
+            let thread = thread_for_task.clone();
+            let state = state_for_task.clone();
+            let sink = sink_for_task.clone();
+            move || execute_run_with_agent_sink(thread, state, 1, Some(sink))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_outcome)) => {
+                let final_record = sink_for_task.finish(AgentTurnStatus::Succeeded, None);
+                sink_for_task.send(AgUiEvent::TextMessageEnd {
+                    message_id: message_id_for_task,
+                    timestamp: now_millis(),
+                });
+                sink_for_task.send(AgUiEvent::RunFinished {
+                    thread_id,
+                    run_id,
+                    timestamp: now_millis(),
+                    result: json!({ "turn": final_record }),
+                });
+            }
+            Ok(Err(failure)) => {
+                let final_record = sink_for_task.finish(
+                    AgentTurnStatus::Failed,
+                    Some(AgentTurnError {
+                        public_message: "处理失败".to_string(),
+                        debug_message: Some(failure.error.clone()),
+                        code: None,
+                    }),
+                );
+                sink_for_task.send(AgUiEvent::RunError {
+                    message: failure.error.clone(),
+                    code: None,
+                    timestamp: now_millis(),
+                });
+                sink_for_task.send(AgUiEvent::RunFinished {
+                    thread_id,
+                    run_id,
+                    timestamp: now_millis(),
+                    result: json!({ "turn": final_record }),
+                });
+            }
+            Err(error) => {
+                let error_text = format!("runtime task failed: {error}");
+                let final_record = sink_for_task.finish(
+                    AgentTurnStatus::Failed,
+                    Some(AgentTurnError {
+                        public_message: "处理失败".to_string(),
+                        debug_message: Some(error_text.clone()),
+                        code: None,
+                    }),
+                );
+                sink_for_task.send(AgUiEvent::RunError {
+                    message: error_text,
+                    code: None,
+                    timestamp: now_millis(),
+                });
+                sink_for_task.send(AgUiEvent::RunFinished {
+                    thread_id,
+                    run_id,
+                    timestamp: now_millis(),
+                    result: json!({ "turn": final_record }),
+                });
+            }
+        }
+    });
+
+    let stream = stream! {
+        while let Some(event) = receiver.recv().await {
+            let data = encode_ag_ui_sse_frame(&event)
+                .unwrap_or_else(|error| format!("data: {{\"type\":\"RUN_ERROR\",\"message\":\"failed to encode event: {error}\",\"timestamp\":{}}}\n\n", now_millis()));
+            yield Ok::<Event, std::convert::Infallible>(
+                Event::default().data(data.trim_start_matches("data: ").trim_end()),
+            );
+            if matches!(event, AgUiEvent::RunFinished { .. } | AgUiEvent::RunError { .. }) {
+                if matches!(event, AgUiEvent::RunFinished { .. }) {
+                    break;
+                }
+            }
         }
     };
     Ok(Sse::new(stream)
@@ -10551,6 +10836,15 @@ fn execute_run(
     state: Arc<AppState>,
     run_id: u64,
 ) -> Result<RunOutcome, RunFailure> {
+    execute_run_with_agent_sink(thread, state, run_id, None)
+}
+
+fn execute_run_with_agent_sink(
+    thread: Arc<ManagedThread>,
+    state: Arc<AppState>,
+    run_id: u64,
+    agent_event_sink: Option<AgentRunEventSink>,
+) -> Result<RunOutcome, RunFailure> {
     let (record, session, request, abort_signal) = {
         let guard = thread
             .shared
@@ -10638,7 +10932,7 @@ fn execute_run(
         abort_signal.clone(),
         None,
         true,
-        None,
+        agent_event_sink.clone(),
     )
     .map_err(|error| RunFailure {
         error,
@@ -10656,7 +10950,7 @@ fn execute_run(
         thread.clone(),
         run_id,
         abort_signal.clone(),
-        None,
+        agent_event_sink,
     );
     let mut runtime =
         ConversationRuntime::new(session, api_client, tool_executor, policy, system_prompt)
@@ -10685,11 +10979,68 @@ struct AgentRunEventSink {
     turn_id: String,
     message_id: String,
     sender: tokio::sync::mpsc::UnboundedSender<AgUiEvent>,
+    store: Arc<ThreadStore>,
+    record: Arc<Mutex<AgentTurnRecord>>,
 }
 
 impl AgentRunEventSink {
     fn send(&self, event: AgUiEvent) {
         let _ = self.sender.send(event);
+    }
+
+    fn append_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut record = self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record.assistant_text.push_str(text);
+        record.status = AgentTurnStatus::Running;
+        let _ = self.store.upsert_agent_turn(&record);
+    }
+
+    fn apply_tool_updates(&self, updates: AgentToolUpdates) {
+        let mut record = self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record.steps.extend(updates.steps.clone());
+        let citation_offset = record.citations.len() as u32;
+        record
+            .citations
+            .extend(updates.citations.iter().cloned().map(|mut citation| {
+                citation.number += citation_offset;
+                citation
+            }));
+        record.expert_results.extend(updates.expert_results.clone());
+        record.debug_events.push(updates.debug_event.clone());
+        record.updated_status_running();
+        let _ = self.store.upsert_agent_turn(&record);
+    }
+
+    fn finish(&self, status: AgentTurnStatus, error: Option<AgentTurnError>) -> AgentTurnRecord {
+        let mut record = self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record.status = status;
+        record.completed_at_ms = Some(now_millis());
+        record.error = error;
+        let _ = self.store.upsert_agent_turn(&record);
+        record.clone()
+    }
+}
+
+trait AgentTurnRecordRuntimeExt {
+    fn updated_status_running(&mut self);
+}
+
+impl AgentTurnRecordRuntimeExt for AgentTurnRecord {
+    fn updated_status_running(&mut self) {
+        self.status = AgentTurnStatus::Running;
+        self.completed_at_ms = None;
     }
 }
 
@@ -11019,6 +11370,7 @@ impl ServiceApiClient {
         }
 
         if let Some(sink) = &self.agent_event_sink {
+            sink.append_text(text);
             sink.send(AgUiEvent::TextMessageContent {
                 message_id: sink.message_id.clone(),
                 delta: text.to_string(),
@@ -11315,6 +11667,7 @@ impl ToolExecutor for ServiceToolExecutor {
                         &output_with_artifact,
                         false,
                     );
+                    sink.apply_tool_updates(updates.clone());
                     sink.send(AgUiEvent::ToolCallResult {
                         tool_call_id: sink.turn_id.clone(),
                         message: output_with_artifact.clone(),
@@ -11367,6 +11720,7 @@ impl ToolExecutor for ServiceToolExecutor {
                         &error_text,
                         true,
                     );
+                    sink.apply_tool_updates(updates.clone());
                     sink.send(AgUiEvent::ToolCallResult {
                         tool_call_id: sink.turn_id.clone(),
                         message: error_text.clone(),
@@ -12699,10 +13053,14 @@ fn allowed_tool_names(
     let managed_root = config.managed_workspaces_dir();
     let has_explicit_workspace =
         has_explicit_project || !record.workspace_root.starts_with(&managed_root);
-    let has_es_access = has_explicit_project && es_access.base_url.is_some();
-    let has_document_access = has_explicit_project && !document_access.files.is_empty();
-    let has_web_access = has_explicit_project && !web_access.urls.is_empty();
-    let has_db_access = has_explicit_project && db_access.url.is_some();
+    let has_es_access = es_access.base_url.is_some()
+        && (has_explicit_project || es_access.source_id.is_some() || !es_access.indices.is_empty());
+    let has_document_access = !document_access.files.is_empty()
+        && (has_explicit_project || document_access.source_id.is_some());
+    let has_web_access =
+        !web_access.urls.is_empty() && (has_explicit_project || web_access.source_id.is_some());
+    let has_db_access =
+        db_access.url.is_some() && (has_explicit_project || db_access.source_id.is_some());
 
     SAFE_BUILTIN_TOOLS
         .iter()
@@ -15054,15 +15412,15 @@ mod tests {
         resolve_es_access, resolve_service_skill, rewrite_tool_input, sqlite_path_from_url,
         thread_is_visible_to_auth, ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord,
         AuditRecord, AuthContext, AuthMode, CapacityUsage, CommandRequest, DataSourceKind,
-        DataSourceRecord, EsConfig, ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest,
-        ExpertPanelRunExpertState, ExpertPanelRunRequest, ExpertPanelRunResponse,
-        ExpertPanelRunStatus, KnowledgeBaseRecord, ManagedThread, MemoryNote, MemoryScope,
-        MemorySearchScope, MessageBlockSnapshot, ModelAccessConfig, MutationRateLimiter,
-        MutationRateUsage, ProjectRecord, ProviderKind, ResearchTaskStage, ResearchTaskStateRecord,
-        ResolvedDataAccess, ResolvedDbAccess, ResolvedDocumentAccess, ResolvedEsAccess,
-        ResolvedWebAccess, RunKind, RunRequest, SkillScope, ThreadRecord, ThreadState,
-        ThreadStatus, ThreadStore, UpdateProjectRequest, CURRENT_DATABASE_SCHEMA_VERSION,
-        MAX_VISIBLE_AUDIT_RECORDS,
+        DataSourceRecord, DocumentFileRecord, EsConfig, ExpertPanelExpert, ExpertPanelExpertStatus,
+        ExpertPanelRequest, ExpertPanelRunExpertState, ExpertPanelRunRequest,
+        ExpertPanelRunResponse, ExpertPanelRunStatus, KnowledgeBaseRecord, ManagedThread,
+        MemoryNote, MemoryScope, MemorySearchScope, MessageBlockSnapshot, ModelAccessConfig,
+        MutationRateLimiter, MutationRateUsage, ProjectRecord, ProviderKind, ResearchTaskStage,
+        ResearchTaskStateRecord, ResolvedDataAccess, ResolvedDbAccess, ResolvedDocumentAccess,
+        ResolvedEsAccess, ResolvedWebAccess, RunKind, RunRequest, SkillScope, ThreadRecord,
+        ThreadState, ThreadStatus, ThreadStore, UpdateProjectRequest,
+        CURRENT_DATABASE_SCHEMA_VERSION, MAX_VISIBLE_AUDIT_RECORDS,
     };
     use crate::agent_turns::{
         AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
@@ -17358,6 +17716,57 @@ mod tests {
         assert!(allowed.contains("MemorySearch"));
         assert!(allowed.contains("TopicDriftCheck"));
         assert!(allowed.contains("ArtifactEmit"));
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn allowed_tool_names_enables_selected_webagent_data_sources_without_workspace_tools() {
+        let temp_dir = test_temp_dir("allowed-tools-webagent-selected-sources");
+        let mut config = test_config(temp_dir.clone());
+        config.es.base_url = Some("http://127.0.0.1:9200".to_string());
+        let registry = build_tool_registry().expect("tool registry");
+        let mut record = test_record(&temp_dir, Some("alice"));
+        record.workspace_root = config.managed_workspace_root(None, "alice");
+
+        let allowed = allowed_tool_names(
+            &config,
+            &registry,
+            &record,
+            &ResolvedEsAccess {
+                base_url: Some("http://127.0.0.1:9200".to_string()),
+                api_key: None,
+                username: None,
+                password: None,
+                default_index: Some("docs".to_string()),
+                indices: vec!["docs".to_string()],
+                source_id: Some("source-es".to_string()),
+                source_name: Some("平台 ES".to_string()),
+            },
+            &ResolvedDocumentAccess {
+                source_id: Some("source-upload".to_string()),
+                source_name: Some("个人上传".to_string()),
+                files: vec![DocumentFileRecord {
+                    id: "file-1".to_string(),
+                    file_name: "report.txt".to_string(),
+                    stored_name: "report.txt".to_string(),
+                    relative_path: "uploads/report.txt".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    size_bytes: 16,
+                    extracted_text: "台海供应链".to_string(),
+                    uploaded_at_ms: 1,
+                }],
+            },
+            &ResolvedWebAccess::default(),
+            &ResolvedDbAccess::default(),
+        );
+
+        assert!(allowed.contains("EsSearch"));
+        assert!(allowed.contains("SourceSearch"));
+        assert!(allowed.contains("SourceRead"));
+        assert!(!allowed.contains("read_file"));
+        assert!(!allowed.contains("glob_search"));
+        assert!(!allowed.contains("grep_search"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }

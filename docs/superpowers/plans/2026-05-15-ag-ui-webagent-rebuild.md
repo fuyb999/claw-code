@@ -894,11 +894,12 @@ git commit -m "feat: add webagent ag ui endpoints"
 
 ### Task 5: Bridge Runtime Streaming, Tools, Citations, And AgentTurn Updates
 
-Status: **partial, in progress** as of 2026-05-15.
+Status: **backend runtime path implemented** as of 2026-05-15.
 
 - Completed: tool-result to public step/citation mapper, `AgentToolUpdates`, focused mapper tests, AG UI skeleton endpoint persistence of forwarded tool updates, and runtime `AgentRunEventSink` plumbing on provider/tool paths.
 - Completed: stale Rust test call sites were updated so Task 4/5 focused tests compile and run.
-- Remaining before Task 5 is complete: `/v1/agent/ag-ui` must create a real runtime-backed run with an active `AgentRunEventSink`, stream provider deltas/tool calls directly from the model/tool executor, update the current `AgentTurnRecord` during the run, and emit `RUN_ERROR` / final `RUN_FINISHED` from runtime completion instead of the current deterministic skeleton.
+- Completed: `/v1/agent/ag-ui` now verifies the WebAgent conversation, creates an internal managed runtime thread, starts a runtime-backed run with an active `AgentRunEventSink`, streams provider deltas/tool calls into AG UI SSE events, updates the current `AgentTurnRecord`, and emits runtime `RUN_ERROR` / `RUN_FINISHED`.
+- Known follow-up: `ToolExecutor::execute` still lacks provider `tool_call_id`, so runtime `TOOL_CALL_RESULT` currently uses the turn id for correlation. A later runtime trait upgrade should pass tool call id through the executor to avoid collisions when several tools run in one turn.
 
 **Files:**
 - Modify: `rust/crates/clawd/src/main.rs`
