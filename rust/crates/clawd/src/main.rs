@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod agent_turns;
 
 use crate::agent_turns::{
-    AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
+    encode_ag_ui_sse_frame, AgUiEvent, AgentConversationRecord, AgentConversationStatus,
+    AgentTurnRecord, AgentTurnStatus,
 };
 use api::{
     model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
@@ -121,6 +122,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .route("/v1/skills", get(list_skills).post(upsert_skill))
             .route("/v1/skills/:name", get(get_skill).delete(delete_skill))
+            .route(
+                "/v1/agent/conversations",
+                get(list_agent_conversations).post(create_agent_conversation),
+            )
+            .route("/v1/agent/conversations/:id/turns", get(list_agent_turns))
+            .route("/v1/agent/ag-ui", post(post_ag_ui_run))
+            .route(
+                "/v1/agent/conversations/:id/interrupt",
+                post(interrupt_agent_conversation),
+            )
             .route("/v1/threads", get(list_threads).post(create_thread))
             .route("/v1/threads/:id", get(get_thread).delete(delete_thread))
             .route("/v1/threads/:id/events", get(thread_events))
@@ -5251,6 +5262,31 @@ struct CreateThreadRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateAgentConversationRequest {
+    title: Option<String>,
+    selected_knowledge_base_ids: Option<Vec<String>>,
+    selected_data_source_ids: Option<Vec<String>>,
+    selected_expert_ids: Option<Vec<String>>,
+    model_profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgUiRunRequest {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+    #[serde(rename = "runId")]
+    run_id: String,
+    #[serde(default)]
+    messages: Vec<Value>,
+    #[serde(default)]
+    state: Value,
+    #[serde(default)]
+    context: Vec<Value>,
+    #[serde(default, rename = "forwardedProps")]
+    forwarded_props: Value,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateProjectRequest {
     name: String,
     description: Option<String>,
@@ -6195,6 +6231,58 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim().to_string();
+        if value.is_empty() || !seen.insert(value.clone()) {
+            continue;
+        }
+        normalized.push(value);
+    }
+    normalized
+}
+
+fn extract_ag_ui_user_message(request: &AgUiRunRequest) -> Option<String> {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find_map(extract_ag_ui_message_text)
+        .or_else(|| {
+            request
+                .forwarded_props
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn extract_ag_ui_message_text(message: &Value) -> Option<String> {
+    let role = message.get("role").and_then(Value::as_str)?;
+    if role != "user" {
+        return None;
+    }
+    let content = message.get("content")?;
+    if let Some(text) = content.as_str() {
+        return normalize_optional_text(Some(text.to_string()));
+    }
+    let parts = content.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|part| {
+            if part.get("type").and_then(Value::as_str) == Some("text") {
+                part.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalize_optional_text(Some(text))
 }
 
 fn normalize_model_access_from_parts(
@@ -7502,6 +7590,178 @@ async fn list_threads(
         })
         .collect::<Vec<_>>();
     Ok(Json(json!({ "threads": threads })))
+}
+
+async fn create_agent_conversation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(request): Json<CreateAgentConversationRequest>,
+) -> Result<Json<AgentConversationRecord>, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let now = now_millis();
+    let record = AgentConversationRecord {
+        id: generate_id("conversation"),
+        tenant_id: auth.tenant_id.clone(),
+        owner_id: auth.user_id.clone(),
+        title: normalize_optional_text(request.title).unwrap_or_else(|| "新对话".to_string()),
+        status: AgentConversationStatus::Idle,
+        selected_knowledge_base_ids: request
+            .selected_knowledge_base_ids
+            .map(normalize_string_list)
+            .unwrap_or_default(),
+        selected_data_source_ids: request
+            .selected_data_source_ids
+            .map(normalize_string_list)
+            .unwrap_or_default(),
+        selected_expert_ids: request
+            .selected_expert_ids
+            .map(normalize_string_list)
+            .unwrap_or_default(),
+        model_profile_id: normalize_optional_text(request.model_profile_id),
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    state
+        .store
+        .upsert_agent_conversation(&record)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(record))
+}
+
+async fn list_agent_conversations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Value>, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let conversations = state
+        .store
+        .list_agent_conversations(auth.tenant_id.as_deref(), &auth.user_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(json!({ "conversations": conversations })))
+}
+
+async fn list_agent_turns(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let turns = state
+        .store
+        .list_agent_turns(&id, auth.tenant_id.as_deref(), &auth.user_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(json!({ "turns": turns })))
+}
+
+async fn post_ag_ui_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(request): Json<AgUiRunRequest>,
+) -> Result<Response, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let now = now_millis();
+    let user_message = extract_ag_ui_user_message(&request).unwrap_or_else(|| "新问题".to_string());
+    let assistant_text = "执行过程已开始，正在持续返回结果。".to_string();
+    let turn_id = if request.run_id.trim().is_empty() {
+        generate_id("turn")
+    } else {
+        request.run_id.trim().to_string()
+    };
+    let message_id = format!("{turn_id}-assistant");
+    let record = AgentTurnRecord {
+        id: turn_id.clone(),
+        conversation_id: request.thread_id.clone(),
+        tenant_id: auth.tenant_id.clone(),
+        owner_id: auth.user_id.clone(),
+        user_message,
+        assistant_text: assistant_text.clone(),
+        status: AgentTurnStatus::Succeeded,
+        started_at_ms: now,
+        completed_at_ms: Some(now),
+        steps: Vec::new(),
+        citations: Vec::new(),
+        expert_results: Vec::new(),
+        artifacts: Vec::new(),
+        error: None,
+        debug_events: Vec::new(),
+    };
+    state
+        .store
+        .upsert_agent_turn(&record)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let events = vec![
+        AgUiEvent::run_started(&request.thread_id, &turn_id, now),
+        AgUiEvent::TextMessageStart {
+            message_id: message_id.clone(),
+            role: "assistant".to_string(),
+            timestamp: now,
+        },
+        AgUiEvent::TextMessageContent {
+            message_id: message_id.clone(),
+            delta: assistant_text,
+            timestamp: now,
+        },
+        AgUiEvent::TextMessageEnd {
+            message_id,
+            timestamp: now,
+        },
+        AgUiEvent::RunFinished {
+            thread_id: request.thread_id,
+            run_id: turn_id,
+            timestamp: now,
+            result: json!({
+                "turn": record,
+                "request_state": request.state,
+                "context_count": request.context.len(),
+            }),
+        },
+    ];
+    let stream = stream! {
+        for event in events {
+            let data = encode_ag_ui_sse_frame(&event)
+                .unwrap_or_else(|error| format!("data: {{\"type\":\"RUN_ERROR\",\"message\":\"failed to encode event: {error}\",\"timestamp\":{}}}\n\n", now_millis()));
+            yield Ok::<Event, std::convert::Infallible>(
+                Event::default().data(data.trim_start_matches("data: ").trim_end()),
+            );
+        }
+    };
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+async fn interrupt_agent_conversation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let mut conversations = state
+        .store
+        .list_agent_conversations(auth.tenant_id.as_deref(), &auth.user_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let Some(mut conversation) = conversations
+        .drain(..)
+        .find(|conversation| conversation.id == id)
+    else {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "conversation not found",
+        ));
+    };
+    conversation.status = AgentConversationStatus::Interrupted;
+    conversation.updated_at_ms = now_millis();
+    state
+        .store
+        .upsert_agent_conversation(&conversation)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(json!({ "conversation": conversation })))
 }
 
 async fn list_projects(
@@ -14440,7 +14700,10 @@ mod tests {
     use crate::agent_turns::{
         AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
     };
-    use crate::{create_expert_panel_run, create_thread, AuthQuery, CreateThreadRequest};
+    use crate::{
+        create_agent_conversation, create_expert_panel_run, create_thread, AuthQuery,
+        CreateAgentConversationRequest, CreateThreadRequest,
+    };
     use api::InputContentBlock;
 
     fn test_thread(owner_id: Option<&str>) -> ManagedThread {
@@ -14546,6 +14809,35 @@ mod tests {
             allowed_roots: vec![data_dir],
             es: EsConfig::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn create_agent_conversation_does_not_require_workspace_root() {
+        let temp_dir = test_temp_dir("agent-conversation-api");
+        let state = Arc::new(AppState::new(Arc::new(test_config(temp_dir))).expect("state"));
+        let request = CreateAgentConversationRequest {
+            title: Some("台海供应链风险".to_string()),
+            selected_knowledge_base_ids: Some(vec!["kb-platform".to_string()]),
+            selected_data_source_ids: None,
+            selected_expert_ids: Some(vec!["howard-wang".to_string()]),
+            model_profile_id: None,
+        };
+
+        let response = create_agent_conversation(
+            State(state),
+            HeaderMap::new(),
+            Query(AuthQuery {
+                user_id: Some("alice".to_string()),
+                api_key: None,
+            }),
+            Json(request),
+        )
+        .await
+        .expect("create conversation")
+        .0;
+
+        assert_eq!(response.title, "台海供应链风险");
+        assert_eq!(response.selected_expert_ids, vec!["howard-wang"]);
     }
 
     fn spawn_openai_error_server(status: &str, body: &'static str) -> String {
