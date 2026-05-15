@@ -84,10 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/v1/knowledge-bases",
                 get(list_knowledge_bases).post(create_knowledge_base),
             )
-            .route(
-                "/v1/knowledge-bases/:id",
-                delete(delete_knowledge_base),
-            )
+            .route("/v1/knowledge-bases/:id", delete(delete_knowledge_base))
             .route(
                 "/v1/data-sources",
                 get(list_data_sources).post(create_data_source),
@@ -377,7 +374,11 @@ fn default_database_url(data_dir: &Path) -> String {
 
 fn parse_identifier_csv(raw: &str) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
     let mut values = BTreeSet::new();
-    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         values.insert(parse_user_id(item)?);
     }
     Ok(values)
@@ -1796,7 +1797,8 @@ impl ThreadStore {
                 transaction.execute("DELETE FROM audit_records WHERE thread_id = ?1", [id])?;
                 transaction.execute("DELETE FROM artifact_records WHERE thread_id = ?1", [id])?;
                 transaction.execute("DELETE FROM memory_notes WHERE thread_id = ?1", [id])?;
-                let affected = transaction.execute("DELETE FROM thread_records WHERE id = ?1", [id])?;
+                let affected =
+                    transaction.execute("DELETE FROM thread_records WHERE id = ?1", [id])?;
                 transaction.commit()?;
                 Ok(affected > 0)
             }
@@ -2178,9 +2180,7 @@ impl ThreadStore {
                 }
                 Ok(records)
             }
-            Self::Postgres { worker, .. } => {
-                worker.list_agent_conversations(tenant_id, owner_id)
-            }
+            Self::Postgres { worker, .. } => worker.list_agent_conversations(tenant_id, owner_id),
         }
     }
 
@@ -7320,10 +7320,7 @@ fn data_source_matches_user_scope(
     }
 }
 
-fn data_source_matches_platform_scope(
-    record: &DataSourceRecord,
-    tenant_id: Option<&str>,
-) -> bool {
+fn data_source_matches_platform_scope(record: &DataSourceRecord, tenant_id: Option<&str>) -> bool {
     record.owner_id.is_none() && data_source_matches_tenant_scope(record, tenant_id)
 }
 
@@ -7633,13 +7630,13 @@ async fn list_agent_conversations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Vec<AgentConversationRecord>>, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
     let conversations = state
         .store
         .list_agent_conversations(auth.tenant_id.as_deref(), &auth.user_id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(json!({ "conversations": conversations })))
+    Ok(Json(conversations))
 }
 
 async fn list_agent_turns(
@@ -7647,13 +7644,13 @@ async fn list_agent_turns(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Vec<AgentTurnRecord>>, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
     let turns = state
         .store
         .list_agent_turns(&id, auth.tenant_id.as_deref(), &auth.user_id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(json!({ "turns": turns })))
+    Ok(Json(turns))
 }
 
 async fn post_ag_ui_run(
@@ -9815,14 +9812,11 @@ fn execute_single_expert_attempt(
         .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
     let tool_registry = build_tool_registry()
         .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
-    let data_access = resolve_thread_data_access(
-        &state.store,
-        &base_record,
-        execution_context.as_ref(),
-    )
-    .map_err(|error| {
-        expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string())
-    })?;
+    let data_access =
+        resolve_thread_data_access(&state.store, &base_record, execution_context.as_ref())
+            .map_err(|error| {
+                expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string())
+            })?;
     let es_access = resolve_es_access(&state.config.es, &data_access);
     let document_access = resolve_document_access(&data_access);
     let web_access = resolve_web_access(&data_access);
@@ -10352,12 +10346,11 @@ fn execute_run(
         outcome: current_run_outcome(&thread),
     })?;
     let data_access =
-        resolve_thread_data_access(&state.store, &effective_record, execution_context.as_ref()).map_err(|error| {
-            RunFailure {
+        resolve_thread_data_access(&state.store, &effective_record, execution_context.as_ref())
+            .map_err(|error| RunFailure {
                 error: error.to_string(),
                 outcome: current_run_outcome(&thread),
-            }
-        })?;
+            })?;
     let es_access = resolve_es_access(&state.config.es, &data_access);
     let document_access = resolve_document_access(&data_access);
     let web_access = resolve_web_access(&data_access);
@@ -11159,14 +11152,17 @@ fn execute_es_search(es: &ResolvedEsAccess, value: Value) -> Result<String, Tool
     let base_url = es.base_url.as_deref().ok_or_else(|| {
         es_search_error("Elasticsearch is not configured", &input, None, None, None)
     })?;
-    let index = input.index.clone().or_else(|| {
-        if es.indices.is_empty() {
-            es.default_index.clone()
-        } else {
-            Some(es.indices.join(","))
-        }
-    })
-    .ok_or_else(|| es_search_error("missing Elasticsearch index", &input, None, None, None))?;
+    let index = input
+        .index
+        .clone()
+        .or_else(|| {
+            if es.indices.is_empty() {
+                es.default_index.clone()
+            } else {
+                Some(es.indices.join(","))
+            }
+        })
+        .ok_or_else(|| es_search_error("missing Elasticsearch index", &input, None, None, None))?;
 
     let url = format!("{}/{}/_search", base_url.trim_end_matches('/'), index);
     let mut body = json!({
@@ -13340,19 +13336,15 @@ fn resolve_override_knowledge_base_for_run(
         .get_knowledge_base(knowledge_base_id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"))?;
-    let can_access = knowledge_base_matches_platform_scope(
-        &knowledge_base,
-        record.tenant_id.as_deref(),
-    ) || record
-        .owner_id
-        .as_deref()
-        .is_some_and(|owner_id| {
-            knowledge_base_matches_user_scope(
-                &knowledge_base,
-                record.tenant_id.as_deref(),
-                owner_id,
-            )
-        });
+    let can_access =
+        knowledge_base_matches_platform_scope(&knowledge_base, record.tenant_id.as_deref())
+            || record.owner_id.as_deref().is_some_and(|owner_id| {
+                knowledge_base_matches_user_scope(
+                    &knowledge_base,
+                    record.tenant_id.as_deref(),
+                    owner_id,
+                )
+            });
     if !can_access {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
@@ -13525,11 +13517,7 @@ fn resolve_es_access(config: &EsConfig, data_access: &ResolvedDataAccess) -> Res
         username: config.username.clone(),
         password: config.password.clone(),
         default_index: config.default_index.clone(),
-        indices: config
-            .default_index
-            .clone()
-            .into_iter()
-            .collect::<Vec<_>>(),
+        indices: config.default_index.clone().into_iter().collect::<Vec<_>>(),
         source_id: None,
         source_name: None,
     }
@@ -15073,10 +15061,7 @@ mod tests {
             .expect("list conversations");
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].id, "conv-1");
-        assert_eq!(
-            conversations[0].selected_knowledge_base_ids,
-            vec!["kb-1"]
-        );
+        assert_eq!(conversations[0].selected_knowledge_base_ids, vec!["kb-1"]);
 
         let turns = store
             .list_agent_turns("conv-1", Some("tenant-a"), "alice")
