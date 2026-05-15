@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +133,118 @@ pub struct AgentTurnRecord {
     pub debug_events: Vec<AgentTurnDebugEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AgUiEvent {
+    #[serde(rename = "RUN_STARTED")]
+    RunStarted {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "RUN_FINISHED")]
+    RunFinished {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+        timestamp: u64,
+        result: Value,
+    },
+    #[serde(rename = "RUN_ERROR")]
+    RunError {
+        message: String,
+        code: Option<String>,
+        timestamp: u64,
+    },
+    #[serde(rename = "TEXT_MESSAGE_START")]
+    TextMessageStart {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        role: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "TEXT_MESSAGE_CONTENT")]
+    TextMessageContent {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        delta: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "TEXT_MESSAGE_END")]
+    TextMessageEnd {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "TOOL_CALL_START")]
+    ToolCallStart {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolCallName")]
+        tool_call_name: String,
+        #[serde(rename = "parentMessageId")]
+        parent_message_id: Option<String>,
+        timestamp: u64,
+    },
+    #[serde(rename = "TOOL_CALL_ARGS")]
+    ToolCallArgs {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        delta: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "TOOL_CALL_END")]
+    ToolCallEnd {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "TOOL_CALL_RESULT")]
+    ToolCallResult {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        message: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "ACTIVITY_DELTA")]
+    ActivityDelta { delta: Value, timestamp: u64 },
+    #[serde(rename = "STATE_SNAPSHOT")]
+    StateSnapshot { snapshot: Value, timestamp: u64 },
+}
+
+impl AgUiEvent {
+    pub fn run_started(thread_id: &str, run_id: &str, timestamp: u64) -> Self {
+        Self::RunStarted {
+            thread_id: thread_id.to_string(),
+            run_id: run_id.to_string(),
+            timestamp,
+        }
+    }
+
+    pub fn text_content(message_id: &str, delta: &str) -> Self {
+        Self::TextMessageContent {
+            message_id: message_id.to_string(),
+            delta: delta.to_string(),
+            timestamp: now_millis(),
+        }
+    }
+}
+
+pub fn encode_ag_ui_sse_frame(event: &AgUiEvent) -> Result<String, serde_json::Error> {
+    let payload = serde_json::to_string(event)?;
+    Ok(format!("data: {payload}\n\n"))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +305,25 @@ mod tests {
         assert_eq!(parsed.steps[0].kind, AgentTurnStepKind::Retrieval);
         assert_eq!(parsed.citations[0].number, 1);
         assert_eq!(parsed.expert_results[0].expert_name, "Howard-Wang");
+    }
+
+    #[test]
+    fn ag_ui_event_serializes_text_delta_shape() {
+        let event = AgUiEvent::text_content("msg-1", "hello");
+        let value = serde_json::to_value(event).expect("serialize event");
+
+        assert_eq!(value["type"], "TEXT_MESSAGE_CONTENT");
+        assert_eq!(value["messageId"], "msg-1");
+        assert_eq!(value["delta"], "hello");
+    }
+
+    #[test]
+    fn ag_ui_sse_frame_uses_json_data_lines() {
+        let event = AgUiEvent::run_started("conv-1", "turn-1", 42);
+        let frame = encode_ag_ui_sse_frame(&event).expect("encode frame");
+
+        assert!(frame.starts_with("data: "));
+        assert!(frame.ends_with("\n\n"));
+        assert!(frame.contains("\"type\":\"RUN_STARTED\""));
     }
 }
