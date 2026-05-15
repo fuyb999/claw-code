@@ -18,6 +18,8 @@ export type MessageBlock =
 export interface ExecutionContextPayload {
   knowledge_base_id?: string | null;
   knowledgeBaseId?: string | null;
+  data_source_ids?: string[] | null;
+  dataSourceIds?: string[] | null;
   knowledge_base_name?: string | null;
   knowledgeBaseName?: string | null;
   auto_retrieval?: boolean | null;
@@ -59,6 +61,30 @@ export interface AuditRecord {
   kind: string;
   created_at_ms: number;
   payload: unknown;
+}
+
+export interface ResearchTaskStatePayload {
+  id: string;
+  title: string;
+  status:
+    | "question"
+    | "retrieval"
+    | "expert_review"
+    | "synthesis"
+    | "writing_ready";
+  status_label: string;
+  next_recommended_action: string;
+  available_actions: string[];
+  stage_history: Array<{
+    stage:
+      | "question"
+      | "retrieval"
+      | "expert_review"
+      | "synthesis"
+      | "writing_ready";
+    label: string;
+    at_ms: number;
+  }>;
 }
 
 export interface TableArtifactColumn {
@@ -279,7 +305,7 @@ export interface UpdateDataSourceRequest {
 export interface CreateProjectRequest {
   name: string;
   description?: string;
-  workspace_root: string;
+  workspace_root?: string;
   default_topic?: string;
   default_model?: string;
   model_base_url?: string;
@@ -309,7 +335,32 @@ export interface UpdateProjectRequest {
 
 export interface RequestAuth {
   apiKey?: string;
+  tenantId?: string;
   userId?: string;
+}
+
+export type AgentConversationStatus = "idle" | "running" | "interrupted" | "failed";
+
+export interface AgentConversationRecord {
+  id: string;
+  tenant_id: string | null;
+  owner_id: string;
+  title: string;
+  status: AgentConversationStatus;
+  selected_knowledge_base_ids: string[];
+  selected_data_source_ids: string[];
+  selected_expert_ids: string[];
+  model_profile_id: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CreateAgentConversationRequest {
+  title?: string;
+  selected_knowledge_base_ids?: string[];
+  selected_data_source_ids?: string[];
+  selected_expert_ids?: string[];
+  model_profile_id?: string | null;
 }
 
 export interface ClawdConfig {
@@ -337,6 +388,7 @@ export interface AuthSession {
   api_key_id: string | null;
   api_key_prefix: string | null;
   display_name: string | null;
+  is_platform_admin: boolean;
 }
 
 export interface ApiKeySummary {
@@ -422,7 +474,8 @@ export interface ExpertPanelRunExpert {
 export interface CreateExpertPanelRunRequest {
   question?: string;
   source_message_id?: string;
-  knowledge_base_id?: string;
+  knowledge_base_id?: string | null;
+  data_source_ids?: string[] | null;
   auto_retrieval?: boolean;
   experts: Array<{
     skill: string;
@@ -461,7 +514,8 @@ export type ThreadCommand =
       type: "user_message";
       content: string;
       expert_panel?: ExpertPanelContext;
-      knowledge_base_id?: string;
+      knowledge_base_id?: string | null;
+      data_source_ids?: string[] | null;
       auto_retrieval?: boolean;
     }
   | { type: "interrupt"; reason?: string }

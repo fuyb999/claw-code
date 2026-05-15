@@ -124,6 +124,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/v1/agent/conversations",
                 get(list_agent_conversations).post(create_agent_conversation),
             )
+            .route(
+                "/v1/agent/conversations/:id",
+                delete(delete_agent_conversation),
+            )
             .route("/v1/agent/conversations/:id/turns", get(list_agent_turns))
             .route("/v1/agent/ag-ui", post(post_ag_ui_run))
             .route(
@@ -897,6 +901,13 @@ enum PostgresRequest {
         owner_id: String,
         reply: mpsc::Sender<Result<Vec<AgentTurnRecord>, String>>,
     },
+    #[allow(dead_code)]
+    DeleteAgentConversation {
+        id: String,
+        tenant_id: Option<String>,
+        owner_id: String,
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
     AppendAuditRecord {
         thread_id: String,
         record: AuditRecord,
@@ -1124,6 +1135,22 @@ impl PostgresWorker {
                             .block_on(postgres_list_agent_turns(
                                 &client,
                                 &conversation_id,
+                                tenant_id.as_deref(),
+                                &owner_id,
+                            ))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::DeleteAgentConversation {
+                        id,
+                        tenant_id,
+                        owner_id,
+                        reply,
+                    } => {
+                        let result = runtime
+                            .block_on(postgres_delete_agent_conversation(
+                                &client,
+                                &id,
                                 tenant_id.as_deref(),
                                 &owner_id,
                             ))
@@ -1557,6 +1584,28 @@ impl PostgresWorker {
         self.sender
             .send(PostgresRequest::ListAgentTurns {
                 conversation_id: conversation_id.to_string(),
+                tenant_id: tenant_id.map(str::to_string),
+                owner_id: owner_id.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    #[allow(dead_code)]
+    fn delete_agent_conversation(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+        owner_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::DeleteAgentConversation {
+                id: id.to_string(),
                 tenant_id: tenant_id.map(str::to_string),
                 owner_id: owner_id.to_string(),
                 reply: reply_tx,
@@ -2214,6 +2263,38 @@ impl ThreadStore {
             }
             Self::Postgres { worker, .. } => {
                 worker.list_agent_turns(conversation_id, tenant_id, owner_id)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn delete_agent_conversation(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+        owner_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let deleted = guard.execute(
+                    "DELETE FROM agent_conversations
+                     WHERE id = ?1 AND tenant_id IS ?2 AND owner_id = ?3",
+                    rusqlite::params![id, tenant_id, owner_id],
+                )?;
+                if deleted > 0 {
+                    guard.execute(
+                        "DELETE FROM agent_turns
+                         WHERE conversation_id = ?1 AND tenant_id IS ?2 AND owner_id = ?3",
+                        rusqlite::params![id, tenant_id, owner_id],
+                    )?;
+                }
+                Ok(deleted > 0)
+            }
+            Self::Postgres { worker, .. } => {
+                worker.delete_agent_conversation(id, tenant_id, owner_id)
             }
         }
     }
@@ -4081,6 +4162,31 @@ async fn postgres_list_agent_turns(
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
         })
         .collect()
+}
+
+async fn postgres_delete_agent_conversation(
+    client: &PostgresClient,
+    id: &str,
+    tenant_id: Option<&str>,
+    owner_id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let deleted = client
+        .execute(
+            "DELETE FROM agent_conversations
+             WHERE id = $1 AND tenant_id IS NOT DISTINCT FROM $2 AND owner_id = $3",
+            &[&id, &tenant_id, &owner_id],
+        )
+        .await?;
+    if deleted > 0 {
+        client
+            .execute(
+                "DELETE FROM agent_turns
+                 WHERE conversation_id = $1 AND tenant_id IS NOT DISTINCT FROM $2 AND owner_id = $3",
+                &[&id, &tenant_id, &owner_id],
+            )
+            .await?;
+    }
+    Ok(deleted > 0)
 }
 
 async fn postgres_delete_data_source(
@@ -6262,6 +6368,61 @@ fn extract_ag_ui_user_message(request: &AgUiRunRequest) -> Option<String> {
         })
 }
 
+fn extract_ag_ui_forwarded_string_list(
+    forwarded_props: &Value,
+    keys: &[&str],
+) -> Option<Vec<String>> {
+    for key in keys {
+        if let Some(value) = forwarded_props.get(*key) {
+            let Some(items) = value.as_array() else {
+                return Some(Vec::new());
+            };
+            return Some(normalize_string_list(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect(),
+            ));
+        }
+    }
+    None
+}
+
+fn apply_ag_ui_forwarded_context(
+    mut conversation: AgentConversationRecord,
+    request: &AgUiRunRequest,
+) -> AgentConversationRecord {
+    if let Some(ids) = extract_ag_ui_forwarded_string_list(
+        &request.forwarded_props,
+        &["selectedKnowledgeBaseIds", "selected_knowledge_base_ids"],
+    ) {
+        conversation.selected_knowledge_base_ids = ids;
+    }
+    if let Some(ids) = extract_ag_ui_forwarded_string_list(
+        &request.forwarded_props,
+        &["selectedDataSourceIds", "selected_data_source_ids"],
+    ) {
+        conversation.selected_data_source_ids = ids;
+    }
+    if let Some(ids) = extract_ag_ui_forwarded_string_list(
+        &request.forwarded_props,
+        &["selectedExpertIds", "selected_expert_ids"],
+    ) {
+        conversation.selected_expert_ids = ids;
+    }
+    if let Some(model_profile_id) = request
+        .forwarded_props
+        .get("modelProfileId")
+        .or_else(|| request.forwarded_props.get("model_profile_id"))
+    {
+        conversation.model_profile_id = model_profile_id
+            .as_str()
+            .and_then(|value| normalize_optional_text(Some(value.to_string())));
+    }
+    conversation
+}
+
 fn extract_ag_ui_message_text(message: &Value) -> Option<String> {
     let role = message.get("role").and_then(Value::as_str)?;
     if role != "user" {
@@ -7859,6 +8020,27 @@ async fn list_agent_turns(
     Ok(Json(turns))
 }
 
+async fn delete_agent_conversation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let deleted = state
+        .store
+        .delete_agent_conversation(&id, auth.tenant_id.as_deref(), &auth.user_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "conversation not found",
+        ))
+    }
+}
+
 fn agent_conversation_for_auth(
     state: &AppState,
     auth: &AuthContext,
@@ -7963,7 +8145,12 @@ async fn post_ag_ui_run(
     Json(request): Json<AgUiRunRequest>,
 ) -> Result<Response, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
-    let conversation = agent_conversation_for_auth(&state, &auth, &request.thread_id)?;
+    let mut conversation = agent_conversation_for_auth(&state, &auth, &request.thread_id)?;
+    conversation = apply_ag_ui_forwarded_context(conversation, &request);
+    state
+        .store
+        .upsert_agent_conversation(&conversation)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     if !extract_ag_ui_forwarded_tool_updates(&request).is_empty() {
         return post_forwarded_ag_ui_run(state, auth, request);
     }
@@ -15604,6 +15791,7 @@ mod tests {
                 state: Value::Null,
                 context: Vec::new(),
                 forwarded_props: json!({
+                    "selectedDataSourceIds": ["ds-live"],
                     "toolResults": [{
                         "toolCallId": "tool-1",
                         "toolName": "EsSearch",
@@ -15630,6 +15818,15 @@ mod tests {
         assert_eq!(turns[0].steps[0].label, "资料检索已返回");
         assert_eq!(turns[0].citations[0].number, 1);
         assert_eq!(turns[0].citations[0].title.as_deref(), Some("供应链报告"));
+
+        let conversations = state
+            .store
+            .list_agent_conversations(None, "alice")
+            .expect("list conversations");
+        assert_eq!(
+            conversations[0].selected_data_source_ids,
+            vec!["ds-live".to_string()]
+        );
     }
 
     fn spawn_openai_error_server(status: &str, body: &'static str) -> String {
@@ -15956,6 +16153,18 @@ mod tests {
             .expect("list turns");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].assistant_text, "结论正文 [1]");
+
+        assert!(store
+            .delete_agent_conversation("conv-1", Some("tenant-a"), "alice")
+            .expect("delete conversation"));
+        assert!(store
+            .list_agent_conversations(Some("tenant-a"), "alice")
+            .expect("list conversations after delete")
+            .is_empty());
+        assert!(store
+            .list_agent_turns("conv-1", Some("tenant-a"), "alice")
+            .expect("list turns after delete")
+            .is_empty());
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
