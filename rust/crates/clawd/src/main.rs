@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod agent_turns;
 
+use crate::agent_turns::{
+    AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
+};
 
 use api::{
     model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock,
@@ -42,7 +45,7 @@ use tools::pdf_extract;
 use tower_http::cors::{Any, CorsLayer};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SAFE_BUILTIN_TOOLS: &[&str] = &["read_file", "glob_search", "grep_search"];
-const CURRENT_DATABASE_SCHEMA_VERSION: u32 = 8;
+const CURRENT_DATABASE_SCHEMA_VERSION: u32 = 9;
 const MAX_VISIBLE_AUDIT_RECORDS: usize = 200;
 const MAX_AUDIT_TEXT_CHARS: usize = 2_000;
 
@@ -696,6 +699,25 @@ enum PostgresRequest {
         now_ms: u64,
         reply: mpsc::Sender<Result<bool, String>>,
     },
+    UpsertAgentConversation {
+        record: AgentConversationRecord,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    UpsertAgentTurn {
+        record: AgentTurnRecord,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    ListAgentConversations {
+        tenant_id: Option<String>,
+        owner_id: String,
+        reply: mpsc::Sender<Result<Vec<AgentConversationRecord>, String>>,
+    },
+    ListAgentTurns {
+        conversation_id: String,
+        tenant_id: Option<String>,
+        owner_id: String,
+        reply: mpsc::Sender<Result<Vec<AgentTurnRecord>, String>>,
+    },
     AppendAuditRecord {
         thread_id: String,
         record: AuditRecord,
@@ -871,6 +893,48 @@ impl PostgresWorker {
                         let result = runtime
                             .block_on(postgres_disable_api_key(
                                 &client, &id, &tenant_id, &user_id, now_ms,
+                            ))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::UpsertAgentConversation { record, reply } => {
+                        let result = runtime
+                            .block_on(postgres_upsert_agent_conversation(&client, &record))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::UpsertAgentTurn { record, reply } => {
+                        let result = runtime
+                            .block_on(postgres_upsert_agent_turn(&client, &record))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::ListAgentConversations {
+                        tenant_id,
+                        owner_id,
+                        reply,
+                    } => {
+                        let result = runtime
+                            .block_on(postgres_list_agent_conversations(
+                                &client,
+                                tenant_id.as_deref(),
+                                &owner_id,
+                            ))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::ListAgentTurns {
+                        conversation_id,
+                        tenant_id,
+                        owner_id,
+                        reply,
+                    } => {
+                        let result = runtime
+                            .block_on(postgres_list_agent_turns(
+                                &client,
+                                &conversation_id,
+                                tenant_id.as_deref(),
+                                &owner_id,
                             ))
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);
@@ -1200,6 +1264,80 @@ impl PostgresWorker {
                 tenant_id: tenant_id.to_string(),
                 user_id: user_id.to_string(),
                 now_ms,
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    fn upsert_agent_conversation(
+        &self,
+        record: &AgentConversationRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::UpsertAgentConversation {
+                record: record.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    fn upsert_agent_turn(
+        &self,
+        record: &AgentTurnRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::UpsertAgentTurn {
+                record: record.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    fn list_agent_conversations(
+        &self,
+        tenant_id: Option<&str>,
+        owner_id: &str,
+    ) -> Result<Vec<AgentConversationRecord>, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::ListAgentConversations {
+                tenant_id: tenant_id.map(str::to_string),
+                owner_id: owner_id.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    fn list_agent_turns(
+        &self,
+        conversation_id: &str,
+        tenant_id: Option<&str>,
+        owner_id: &str,
+    ) -> Result<Vec<AgentTurnRecord>, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::ListAgentTurns {
+                conversation_id: conversation_id.to_string(),
+                tenant_id: tenant_id.map(str::to_string),
+                owner_id: owner_id.to_string(),
                 reply: reply_tx,
             })
             .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
@@ -1678,6 +1816,147 @@ impl ThreadStore {
                 disable_sqlite_api_key(&guard, id, tenant_id, user_id, now_ms)
             }
             Self::Postgres { worker, .. } => worker.disable_api_key(id, tenant_id, user_id, now_ms),
+        }
+    }
+
+    fn upsert_agent_conversation(
+        &self,
+        record: &AgentConversationRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let updated_at_ms = i64::try_from(record.updated_at_ms)?;
+        let record_json = serde_json::to_string(record)?;
+
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.execute(
+                    "INSERT INTO agent_conversations (id, tenant_id, owner_id, status, updated_at_ms, record_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO UPDATE SET
+                       tenant_id = excluded.tenant_id,
+                       owner_id = excluded.owner_id,
+                       status = excluded.status,
+                       updated_at_ms = excluded.updated_at_ms,
+                       record_json = excluded.record_json",
+                    rusqlite::params![
+                        &record.id,
+                        &record.tenant_id,
+                        &record.owner_id,
+                        agent_conversation_status_as_str(&record.status),
+                        updated_at_ms,
+                        &record_json
+                    ],
+                )?;
+                Ok(())
+            }
+            Self::Postgres { worker, .. } => worker.upsert_agent_conversation(record),
+        }
+    }
+
+    fn upsert_agent_turn(
+        &self,
+        record: &AgentTurnRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let started_at_ms = i64::try_from(record.started_at_ms)?;
+        let completed_at_ms = record.completed_at_ms.map(i64::try_from).transpose()?;
+        let record_json = serde_json::to_string(record)?;
+
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.execute(
+                    "INSERT INTO agent_turns (
+                        id, conversation_id, tenant_id, owner_id, status, started_at_ms, completed_at_ms, record_json
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(id) DO UPDATE SET
+                       conversation_id = excluded.conversation_id,
+                       tenant_id = excluded.tenant_id,
+                       owner_id = excluded.owner_id,
+                       status = excluded.status,
+                       started_at_ms = excluded.started_at_ms,
+                       completed_at_ms = excluded.completed_at_ms,
+                       record_json = excluded.record_json",
+                    rusqlite::params![
+                        &record.id,
+                        &record.conversation_id,
+                        &record.tenant_id,
+                        &record.owner_id,
+                        agent_turn_status_as_str(&record.status),
+                        started_at_ms,
+                        completed_at_ms,
+                        &record_json
+                    ],
+                )?;
+                Ok(())
+            }
+            Self::Postgres { worker, .. } => worker.upsert_agent_turn(record),
+        }
+    }
+
+    fn list_agent_conversations(
+        &self,
+        tenant_id: Option<&str>,
+        owner_id: &str,
+    ) -> Result<Vec<AgentConversationRecord>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut statement = guard.prepare(
+                    "SELECT record_json FROM agent_conversations
+                     WHERE tenant_id IS ?1 AND owner_id = ?2
+                     ORDER BY updated_at_ms DESC, id DESC",
+                )?;
+                let rows = statement.query_map(rusqlite::params![tenant_id, owner_id], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut records = Vec::new();
+                for row in rows {
+                    records.push(serde_json::from_str::<AgentConversationRecord>(&row?)?);
+                }
+                Ok(records)
+            }
+            Self::Postgres { worker, .. } => {
+                worker.list_agent_conversations(tenant_id, owner_id)
+            }
+        }
+    }
+
+    fn list_agent_turns(
+        &self,
+        conversation_id: &str,
+        tenant_id: Option<&str>,
+        owner_id: &str,
+    ) -> Result<Vec<AgentTurnRecord>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut statement = guard.prepare(
+                    "SELECT record_json FROM agent_turns
+                     WHERE conversation_id = ?1 AND tenant_id IS ?2 AND owner_id = ?3
+                     ORDER BY started_at_ms ASC, id ASC",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![conversation_id, tenant_id, owner_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let mut records = Vec::new();
+                for row in rows {
+                    records.push(serde_json::from_str::<AgentTurnRecord>(&row?)?);
+                }
+                Ok(records)
+            }
+            Self::Postgres { worker, .. } => {
+                worker.list_agent_turns(conversation_id, tenant_id, owner_id)
+            }
         }
     }
 
@@ -2172,11 +2451,68 @@ fn apply_sqlite_migration(
                     ON acp_connectors (knowledge_base_id, updated_at_ms DESC);",
             )?;
         }
+        9 => {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_conversations (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NULL,
+                    owner_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    record_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_conversations_owner_updated
+                    ON agent_conversations (tenant_id, owner_id, updated_at_ms DESC);
+                CREATE TABLE IF NOT EXISTS agent_turns (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    tenant_id TEXT NULL,
+                    owner_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    completed_at_ms INTEGER NULL,
+                    record_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation_started
+                    ON agent_turns (conversation_id, started_at_ms ASC, id ASC);
+                CREATE TABLE IF NOT EXISTS ag_ui_events (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    tenant_id TEXT NULL,
+                    owner_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ag_ui_events_turn_created
+                    ON ag_ui_events (turn_id, created_at_ms ASC, id ASC);",
+            )?;
+        }
         other => {
             return Err(format!("unsupported sqlite schema migration {other}").into());
         }
     }
     Ok(())
+}
+
+fn agent_conversation_status_as_str(status: &AgentConversationStatus) -> &'static str {
+    match status {
+        AgentConversationStatus::Idle => "idle",
+        AgentConversationStatus::Running => "running",
+        AgentConversationStatus::Interrupted => "interrupted",
+        AgentConversationStatus::Failed => "failed",
+    }
+}
+
+fn agent_turn_status_as_str(status: &AgentTurnStatus) -> &'static str {
+    match status {
+        AgentTurnStatus::Queued => "queued",
+        AgentTurnStatus::Running => "running",
+        AgentTurnStatus::Succeeded => "succeeded",
+        AgentTurnStatus::Interrupted => "interrupted",
+        AgentTurnStatus::Failed => "failed",
+    }
 }
 
 fn backfill_sqlite_derived_tables(
@@ -3009,6 +3345,46 @@ async fn apply_postgres_migration(
                 )
                 .await?;
         }
+        9 => {
+            client
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS agent_conversations (
+                        id TEXT PRIMARY KEY,
+                        tenant_id TEXT NULL,
+                        owner_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        updated_at_ms BIGINT NOT NULL,
+                        record_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_agent_conversations_owner_updated
+                        ON agent_conversations (tenant_id, owner_id, updated_at_ms DESC);
+                    CREATE TABLE IF NOT EXISTS agent_turns (
+                        id TEXT PRIMARY KEY,
+                        conversation_id TEXT NOT NULL,
+                        tenant_id TEXT NULL,
+                        owner_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        started_at_ms BIGINT NOT NULL,
+                        completed_at_ms BIGINT NULL,
+                        record_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation_started
+                        ON agent_turns (conversation_id, started_at_ms ASC, id ASC);
+                    CREATE TABLE IF NOT EXISTS ag_ui_events (
+                        id TEXT PRIMARY KEY,
+                        conversation_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        tenant_id TEXT NULL,
+                        owner_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        created_at_ms BIGINT NOT NULL,
+                        payload_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_ag_ui_events_turn_created
+                        ON ag_ui_events (turn_id, created_at_ms ASC, id ASC);",
+                )
+                .await?;
+        }
         other => {
             return Err(format!("unsupported postgres schema migration {other}").into());
         }
@@ -3336,6 +3712,116 @@ async fn postgres_upsert_data_source(
         )
         .await?;
     Ok(())
+}
+
+async fn postgres_upsert_agent_conversation(
+    client: &PostgresClient,
+    record: &AgentConversationRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let updated_at_ms = i64::try_from(record.updated_at_ms)?;
+    let record_json = serde_json::to_string(record)?;
+    client
+        .execute(
+            "INSERT INTO agent_conversations (id, tenant_id, owner_id, status, updated_at_ms, record_json)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(id) DO UPDATE SET
+               tenant_id = EXCLUDED.tenant_id,
+               owner_id = EXCLUDED.owner_id,
+               status = EXCLUDED.status,
+               updated_at_ms = EXCLUDED.updated_at_ms,
+               record_json = EXCLUDED.record_json",
+            &[
+                &record.id,
+                &record.tenant_id,
+                &record.owner_id,
+                &agent_conversation_status_as_str(&record.status),
+                &updated_at_ms,
+                &record_json,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn postgres_upsert_agent_turn(
+    client: &PostgresClient,
+    record: &AgentTurnRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started_at_ms = i64::try_from(record.started_at_ms)?;
+    let completed_at_ms = record.completed_at_ms.map(i64::try_from).transpose()?;
+    let record_json = serde_json::to_string(record)?;
+    client
+        .execute(
+            "INSERT INTO agent_turns (
+                id, conversation_id, tenant_id, owner_id, status, started_at_ms, completed_at_ms, record_json
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT(id) DO UPDATE SET
+               conversation_id = EXCLUDED.conversation_id,
+               tenant_id = EXCLUDED.tenant_id,
+               owner_id = EXCLUDED.owner_id,
+               status = EXCLUDED.status,
+               started_at_ms = EXCLUDED.started_at_ms,
+               completed_at_ms = EXCLUDED.completed_at_ms,
+               record_json = EXCLUDED.record_json",
+            &[
+                &record.id,
+                &record.conversation_id,
+                &record.tenant_id,
+                &record.owner_id,
+                &agent_turn_status_as_str(&record.status),
+                &started_at_ms,
+                &completed_at_ms,
+                &record_json,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn postgres_list_agent_conversations(
+    client: &PostgresClient,
+    tenant_id: Option<&str>,
+    owner_id: &str,
+) -> Result<Vec<AgentConversationRecord>, Box<dyn std::error::Error>> {
+    let rows = client
+        .query(
+            "SELECT record_json FROM agent_conversations
+             WHERE tenant_id IS NOT DISTINCT FROM $1 AND owner_id = $2
+             ORDER BY updated_at_ms DESC, id DESC",
+            &[&tenant_id, &owner_id],
+        )
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let raw: String = row.get(0);
+            serde_json::from_str::<AgentConversationRecord>(&raw)
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        })
+        .collect()
+}
+
+async fn postgres_list_agent_turns(
+    client: &PostgresClient,
+    conversation_id: &str,
+    tenant_id: Option<&str>,
+    owner_id: &str,
+) -> Result<Vec<AgentTurnRecord>, Box<dyn std::error::Error>> {
+    let rows = client
+        .query(
+            "SELECT record_json FROM agent_turns
+             WHERE conversation_id = $1 AND tenant_id IS NOT DISTINCT FROM $2 AND owner_id = $3
+             ORDER BY started_at_ms ASC, id ASC",
+            &[&conversation_id, &tenant_id, &owner_id],
+        )
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let raw: String = row.get(0);
+            serde_json::from_str::<AgentTurnRecord>(&raw)
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        })
+        .collect()
 }
 
 async fn postgres_delete_data_source(
@@ -13039,6 +13525,70 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    fn test_agent_turn_record(id: &str, conversation_id: &str, owner_id: &str) -> AgentTurnRecord {
+        AgentTurnRecord {
+            id: id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            tenant_id: Some("tenant-a".to_string()),
+            owner_id: owner_id.to_string(),
+            user_message: "问题".to_string(),
+            assistant_text: String::new(),
+            status: AgentTurnStatus::Running,
+            started_at_ms: 10,
+            completed_at_ms: None,
+            steps: Vec::new(),
+            citations: Vec::new(),
+            expert_results: Vec::new(),
+            artifacts: Vec::new(),
+            error: None,
+            debug_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sqlite_store_round_trips_agent_conversations_and_turns() {
+        let temp_dir = test_temp_dir("sqlite-agent-turns");
+        let config = test_config(temp_dir.clone());
+        let store = ThreadStore::open(&config).expect("open sqlite store");
+
+        let conversation = AgentConversationRecord {
+            id: "conv-1".to_string(),
+            tenant_id: Some("tenant-a".to_string()),
+            owner_id: "alice".to_string(),
+            title: "台海供应链风险".to_string(),
+            status: AgentConversationStatus::Running,
+            selected_knowledge_base_ids: vec!["kb-1".to_string()],
+            selected_data_source_ids: vec!["ds-1".to_string()],
+            selected_expert_ids: vec!["howard-wang".to_string()],
+            model_profile_id: Some("platform-default".to_string()),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+        store
+            .upsert_agent_conversation(&conversation)
+            .expect("save conversation");
+
+        let mut turn = test_agent_turn_record("turn-1", "conv-1", "alice");
+        turn.assistant_text = "结论正文 [1]".to_string();
+        store.upsert_agent_turn(&turn).expect("save turn");
+
+        let conversations = store
+            .list_agent_conversations(Some("tenant-a"), "alice")
+            .expect("list conversations");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].id, "conv-1");
+        assert_eq!(
+            conversations[0].selected_knowledge_base_ids,
+            vec!["kb-1"]
+        );
+
+        let turns = store
+            .list_agent_turns("conv-1", Some("tenant-a"), "alice")
+            .expect("list turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].assistant_text, "结论正文 [1]");
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
