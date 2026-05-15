@@ -182,6 +182,10 @@ mod tests {
         };
 
         let raw = serde_json::to_string(&turn).expect("serialize turn");
+        assert!(raw.contains("\"status\":\"succeeded\""));
+        assert!(raw.contains("\"kind\":\"retrieval\""));
+        assert!(raw.contains("\"expert_name\":\"Howard-Wang\""));
+
         let parsed: AgentTurnRecord = serde_json::from_str(&raw).expect("deserialize turn");
 
         assert_eq!(parsed.id, "turn-1");
