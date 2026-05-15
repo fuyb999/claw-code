@@ -132,6 +132,14 @@ pub struct AgentTurnRecord {
     pub debug_events: Vec<AgentTurnDebugEvent>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentToolUpdates {
+    pub steps: Vec<AgentTurnStep>,
+    pub citations: Vec<AgentCitation>,
+    pub expert_results: Vec<AgentExpertResult>,
+    pub debug_event: AgentTurnDebugEvent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgUiEvent {

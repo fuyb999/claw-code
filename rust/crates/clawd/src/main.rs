@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod agent_turns;
 
 use crate::agent_turns::{
-    encode_ag_ui_sse_frame, AgUiEvent, AgentConversationRecord, AgentConversationStatus,
-    AgentTurnRecord, AgentTurnStatus,
+    encode_ag_ui_sse_frame, AgUiEvent, AgentCitation, AgentConversationRecord,
+    AgentConversationStatus, AgentToolUpdates, AgentTurnDebugEvent, AgentTurnRecord,
+    AgentTurnStatus, AgentTurnStep, AgentTurnStepKind, AgentTurnStepStatus,
 };
 use api::{
     model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
@@ -6285,6 +6286,211 @@ fn extract_ag_ui_message_text(message: &Value) -> Option<String> {
     normalize_optional_text(Some(text))
 }
 
+fn map_tool_result_to_agent_updates(
+    tool_call_id: &str,
+    tool_name: &str,
+    input: &str,
+    output: &str,
+    is_error: bool,
+) -> AgentToolUpdates {
+    let now = now_millis();
+    let parsed = serde_json::from_str::<Value>(output).unwrap_or(Value::String(output.to_string()));
+    let citations = extract_agent_citations(tool_call_id, tool_name, &parsed);
+    let public_label = match tool_name {
+        "EsSearch" | "SourceSearch" => {
+            if is_error {
+                "资料检索失败"
+            } else {
+                "资料检索已返回"
+            }
+        }
+        "DbQuery" => {
+            if is_error {
+                "数据库查询失败"
+            } else {
+                "数据库查询已返回"
+            }
+        }
+        "ArtifactEmit" => {
+            if is_error {
+                "产物生成失败"
+            } else {
+                "产物已生成"
+            }
+        }
+        _ => {
+            if is_error {
+                "工具执行失败"
+            } else {
+                "工具执行完成"
+            }
+        }
+    };
+    let step_kind = if matches!(tool_name, "EsSearch" | "SourceSearch") {
+        AgentTurnStepKind::Retrieval
+    } else {
+        AgentTurnStepKind::Tool
+    };
+
+    AgentToolUpdates {
+        steps: vec![AgentTurnStep {
+            id: format!("step-{tool_call_id}"),
+            kind: step_kind,
+            label: public_label.to_string(),
+            detail: Some(if citations.is_empty() {
+                "未生成引用".to_string()
+            } else {
+                format!("生成 {} 条引用", citations.len())
+            }),
+            status: if is_error {
+                AgentTurnStepStatus::Failed
+            } else {
+                AgentTurnStepStatus::Succeeded
+            },
+            started_at_ms: None,
+            completed_at_ms: Some(now),
+            public_payload: json!({ "citation_count": citations.len() }),
+            debug_payload: Some(json!({ "tool": tool_name, "input": input, "output": output })),
+        }],
+        citations,
+        expert_results: Vec::new(),
+        debug_event: AgentTurnDebugEvent {
+            event_type: "TOOL_CALL_RESULT".to_string(),
+            at_ms: now,
+            payload: json!({
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "isError": is_error,
+            }),
+        },
+    }
+}
+
+fn extract_agent_citations(
+    tool_call_id: &str,
+    tool_name: &str,
+    parsed_output: &Value,
+) -> Vec<AgentCitation> {
+    if !matches!(tool_name, "EsSearch" | "SourceSearch") {
+        return Vec::new();
+    }
+    let Some(hits) = parsed_output.get("hits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    hits.iter()
+        .enumerate()
+        .map(|(index, hit)| {
+            let source = hit.get("_source").unwrap_or(hit);
+            let title = value_string(source, &["title", "name", "file"])
+                .or_else(|| value_string(hit, &["title", "name", "file"]));
+            let preview = value_string(
+                source,
+                &["preview", "snippet", "summary", "text", "content"],
+            )
+            .or_else(|| value_string(hit, &["preview", "snippet", "summary", "text", "content"]))
+            .unwrap_or_default();
+            let location = value_string(source, &["location", "path", "url", "id"])
+                .or_else(|| value_string(hit, &["location", "path", "url", "id", "_id"]));
+            AgentCitation {
+                id: format!("{tool_call_id}#hit-{index}"),
+                number: (index + 1) as u32,
+                source_kind: if tool_name == "EsSearch" {
+                    "es".to_string()
+                } else {
+                    "source".to_string()
+                },
+                source_label: parsed_output
+                    .get("data_source_name")
+                    .or_else(|| parsed_output.get("index"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("平台资料库")
+                    .to_string(),
+                title,
+                location,
+                preview,
+                debug_payload: Some(hit.clone()),
+            }
+        })
+        .collect()
+}
+
+fn value_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn renumber_agent_tool_updates(mut updates: Vec<AgentToolUpdates>) -> Vec<AgentToolUpdates> {
+    let mut next_number = 1_u32;
+    for update in &mut updates {
+        for citation in &mut update.citations {
+            citation.number = next_number;
+            next_number += 1;
+        }
+    }
+    updates
+}
+
+fn extract_ag_ui_forwarded_tool_updates(request: &AgUiRunRequest) -> Vec<AgentToolUpdates> {
+    let Some(tool_results) = request
+        .forwarded_props
+        .get("toolResults")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let updates = tool_results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let tool_name = item
+                .get("toolName")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)?;
+            let tool_call_id = item
+                .get("toolCallId")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("tool-{index}"));
+            let input = item
+                .get("input")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "{}".to_string());
+            let output = item
+                .get("output")
+                .or_else(|| item.get("result"))
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_default();
+            let is_error = item
+                .get("isError")
+                .or_else(|| item.get("is_error"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(map_tool_result_to_agent_updates(
+                &tool_call_id,
+                tool_name,
+                &input,
+                &output,
+                is_error,
+            ))
+        })
+        .collect();
+    renumber_agent_tool_updates(updates)
+}
+
 fn normalize_model_access_from_parts(
     base_url: Option<String>,
     base_url_env: Option<String>,
@@ -7663,6 +7869,7 @@ async fn post_ag_ui_run(
     let now = now_millis();
     let user_message = extract_ag_ui_user_message(&request).unwrap_or_else(|| "新问题".to_string());
     let assistant_text = "执行过程已开始，正在持续返回结果。".to_string();
+    let tool_updates = extract_ag_ui_forwarded_tool_updates(&request);
     let turn_id = if request.run_id.trim().is_empty() {
         generate_id("turn")
     } else {
@@ -7679,19 +7886,31 @@ async fn post_ag_ui_run(
         status: AgentTurnStatus::Succeeded,
         started_at_ms: now,
         completed_at_ms: Some(now),
-        steps: Vec::new(),
-        citations: Vec::new(),
-        expert_results: Vec::new(),
+        steps: tool_updates
+            .iter()
+            .flat_map(|update| update.steps.clone())
+            .collect(),
+        citations: tool_updates
+            .iter()
+            .flat_map(|update| update.citations.clone())
+            .collect(),
+        expert_results: tool_updates
+            .iter()
+            .flat_map(|update| update.expert_results.clone())
+            .collect(),
         artifacts: Vec::new(),
         error: None,
-        debug_events: Vec::new(),
+        debug_events: tool_updates
+            .iter()
+            .map(|update| update.debug_event.clone())
+            .collect(),
     };
     state
         .store
         .upsert_agent_turn(&record)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    let events = vec![
+    let mut events = vec![
         AgUiEvent::run_started(&request.thread_id, &turn_id, now),
         AgUiEvent::TextMessageStart {
             message_id: message_id.clone(),
@@ -7703,6 +7922,29 @@ async fn post_ag_ui_run(
             delta: assistant_text,
             timestamp: now,
         },
+    ];
+    for update in &tool_updates {
+        let status = update
+            .steps
+            .first()
+            .map(|step| step.status.clone())
+            .unwrap_or(AgentTurnStepStatus::Succeeded);
+        events.push(AgUiEvent::ActivityDelta {
+            delta: json!({
+                "kind": "tool",
+                "status": status,
+                "steps": update.steps,
+                "citations": update.citations,
+                "expertResults": update.expert_results,
+            }),
+            timestamp: now,
+        });
+        events.push(AgUiEvent::StateSnapshot {
+            snapshot: json!({ "debugEvent": update.debug_event }),
+            timestamp: now,
+        });
+    }
+    events.extend([
         AgUiEvent::TextMessageEnd {
             message_id,
             timestamp: now,
@@ -7717,7 +7959,7 @@ async fn post_ag_ui_run(
                 "context_count": request.context.len(),
             }),
         },
-    ];
+    ]);
     let stream = stream! {
         for event in events {
             let data = encode_ag_ui_sse_frame(&event)
@@ -9874,6 +10116,7 @@ fn execute_single_expert_attempt(
             attempt: input.attempt,
         })),
         stream_to_thread,
+        None,
     )
     .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
     let tool_executor = ServiceToolExecutor::new(
@@ -9888,6 +10131,7 @@ fn execute_single_expert_attempt(
         thread,
         run_id,
         abort_signal.clone(),
+        None,
     );
     let mut runtime = ConversationRuntime::new(
         expert_sub_session_from_base(&base_session, &base_record),
@@ -10394,6 +10638,7 @@ fn execute_run(
         abort_signal.clone(),
         None,
         true,
+        None,
     )
     .map_err(|error| RunFailure {
         error,
@@ -10411,6 +10656,7 @@ fn execute_run(
         thread.clone(),
         run_id,
         abort_signal.clone(),
+        None,
     );
     let mut runtime =
         ConversationRuntime::new(session, api_client, tool_executor, policy, system_prompt)
@@ -10432,6 +10678,19 @@ fn execute_run(
 struct RunFailure {
     error: String,
     outcome: RunOutcome,
+}
+
+#[derive(Clone)]
+struct AgentRunEventSink {
+    turn_id: String,
+    message_id: String,
+    sender: tokio::sync::mpsc::UnboundedSender<AgUiEvent>,
+}
+
+impl AgentRunEventSink {
+    fn send(&self, event: AgUiEvent) {
+        let _ = self.sender.send(event);
+    }
 }
 
 fn build_system_prompt(
@@ -10703,6 +10962,7 @@ struct ServiceApiClient {
     abort_signal: HookAbortSignal,
     expert_stream: Option<ExpertStreamContext>,
     stream_to_thread: bool,
+    agent_event_sink: Option<AgentRunEventSink>,
 }
 
 impl ServiceApiClient {
@@ -10716,6 +10976,7 @@ impl ServiceApiClient {
         abort_signal: HookAbortSignal,
         expert_stream: Option<ExpertStreamContext>,
         stream_to_thread: bool,
+        agent_event_sink: Option<AgentRunEventSink>,
     ) -> Result<Self, String> {
         let base_url = resolve_model_access_value(
             record.model_access.base_url.as_deref(),
@@ -10748,12 +11009,21 @@ impl ServiceApiClient {
             abort_signal,
             expert_stream,
             stream_to_thread,
+            agent_event_sink,
         })
     }
 
     fn publish_stream_text(&self, text: &str) {
         if text.is_empty() {
             return;
+        }
+
+        if let Some(sink) = &self.agent_event_sink {
+            sink.send(AgUiEvent::TextMessageContent {
+                message_id: sink.message_id.clone(),
+                delta: text.to_string(),
+                timestamp: now_millis(),
+            });
         }
 
         if self.stream_to_thread {
@@ -10811,6 +11081,7 @@ impl ServiceApiClient {
                             true,
                             self.stream_to_thread,
                             self.expert_stream.as_ref(),
+                            self.agent_event_sink.as_ref(),
                         );
                     }
                 }
@@ -10823,6 +11094,7 @@ impl ServiceApiClient {
                         true,
                         self.stream_to_thread,
                         self.expert_stream.as_ref(),
+                        self.agent_event_sink.as_ref(),
                     );
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -10842,6 +11114,22 @@ impl ServiceApiClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     if let Some((id, name, input)) = pending_tool.take() {
+                        if let Some(sink) = &self.agent_event_sink {
+                            sink.send(AgUiEvent::ToolCallEnd {
+                                tool_call_id: id.clone(),
+                                timestamp: now_millis(),
+                            });
+                            sink.send(AgUiEvent::ActivityDelta {
+                                delta: json!({
+                                    "kind": "tool",
+                                    "status": "running",
+                                    "toolCallId": id.clone(),
+                                    "toolName": name.clone(),
+                                    "label": "正在调用工具",
+                                }),
+                                timestamp: now_millis(),
+                            });
+                        }
                         self.thread.publish(
                             "tool_use",
                             json!({ "id": id, "name": name, "input": input }),
@@ -10925,6 +11213,7 @@ struct ServiceToolExecutor {
     thread: Arc<ManagedThread>,
     run_id: u64,
     abort_signal: HookAbortSignal,
+    agent_event_sink: Option<AgentRunEventSink>,
 }
 
 impl ServiceToolExecutor {
@@ -10940,6 +11229,7 @@ impl ServiceToolExecutor {
         thread: Arc<ManagedThread>,
         run_id: u64,
         abort_signal: HookAbortSignal,
+        agent_event_sink: Option<AgentRunEventSink>,
     ) -> Self {
         Self {
             tool_registry,
@@ -10953,6 +11243,7 @@ impl ServiceToolExecutor {
             thread,
             run_id,
             abort_signal,
+            agent_event_sink,
         }
     }
 
@@ -11016,6 +11307,40 @@ impl ToolExecutor for ServiceToolExecutor {
                     "tool_result",
                     json!({ "tool_name": tool_name, "output": output_with_artifact, "is_error": false }),
                 );
+                if let Some(sink) = &self.agent_event_sink {
+                    let updates = map_tool_result_to_agent_updates(
+                        &sink.turn_id,
+                        tool_name,
+                        input,
+                        &output_with_artifact,
+                        false,
+                    );
+                    sink.send(AgUiEvent::ToolCallResult {
+                        tool_call_id: sink.turn_id.clone(),
+                        message: output_with_artifact.clone(),
+                        timestamp: now_millis(),
+                    });
+                    sink.send(AgUiEvent::ActivityDelta {
+                        delta: json!({
+                            "kind": "tool",
+                            "status": "succeeded",
+                            "toolName": tool_name,
+                            "label": updates
+                                .steps
+                                .first()
+                                .map(|step| step.label.as_str())
+                                .unwrap_or("工具执行完成"),
+                            "steps": updates.steps,
+                            "citations": updates.citations,
+                            "expertResults": updates.expert_results,
+                        }),
+                        timestamp: now_millis(),
+                    });
+                    sink.send(AgUiEvent::StateSnapshot {
+                        snapshot: json!({ "debugEvent": updates.debug_event }),
+                        timestamp: now_millis(),
+                    });
+                }
                 try_append_thread_audit(
                     &self.state.store,
                     &self.thread,
@@ -11029,10 +11354,45 @@ impl ToolExecutor for ServiceToolExecutor {
                 );
             }
             Err(error) => {
+                let error_text = error.to_string();
                 self.thread.publish(
                     "tool_result",
-                    json!({ "tool_name": tool_name, "output": error.to_string(), "is_error": true }),
+                    json!({ "tool_name": tool_name, "output": error_text, "is_error": true }),
                 );
+                if let Some(sink) = &self.agent_event_sink {
+                    let updates = map_tool_result_to_agent_updates(
+                        &sink.turn_id,
+                        tool_name,
+                        input,
+                        &error_text,
+                        true,
+                    );
+                    sink.send(AgUiEvent::ToolCallResult {
+                        tool_call_id: sink.turn_id.clone(),
+                        message: error_text.clone(),
+                        timestamp: now_millis(),
+                    });
+                    sink.send(AgUiEvent::ActivityDelta {
+                        delta: json!({
+                            "kind": "tool",
+                            "status": "failed",
+                            "toolName": tool_name,
+                            "label": updates
+                                .steps
+                                .first()
+                                .map(|step| step.label.as_str())
+                                .unwrap_or("工具执行失败"),
+                            "steps": updates.steps,
+                            "citations": updates.citations,
+                            "expertResults": updates.expert_results,
+                        }),
+                        timestamp: now_millis(),
+                    });
+                    sink.send(AgUiEvent::StateSnapshot {
+                        snapshot: json!({ "debugEvent": updates.debug_event }),
+                        timestamp: now_millis(),
+                    });
+                }
                 try_append_thread_audit(
                     &self.state.store,
                     &self.thread,
@@ -11041,7 +11401,7 @@ impl ToolExecutor for ServiceToolExecutor {
                     json!({
                         "tool_name": tool_name,
                         "is_error": true,
-                        "output": truncate_audit_text(&error.to_string()),
+                        "output": truncate_audit_text(&error_text),
                     }),
                 );
             }
@@ -12505,6 +12865,7 @@ fn push_output_block(
     streaming_tool_input: bool,
     stream_to_thread: bool,
     expert_stream: Option<&ExpertStreamContext>,
+    agent_event_sink: Option<&AgentRunEventSink>,
 ) {
     match block {
         OutputContentBlock::Text { text } => {
@@ -12533,6 +12894,21 @@ fn push_output_block(
             } else {
                 input.to_string()
             };
+            if let Some(sink) = agent_event_sink {
+                sink.send(AgUiEvent::ToolCallStart {
+                    tool_call_id: id.clone(),
+                    tool_call_name: name.clone(),
+                    parent_message_id: Some(sink.message_id.clone()),
+                    timestamp: now_millis(),
+                });
+                if !initial_input.is_empty() {
+                    sink.send(AgUiEvent::ToolCallArgs {
+                        tool_call_id: id.clone(),
+                        delta: initial_input.clone(),
+                        timestamp: now_millis(),
+                    });
+                }
+            }
             *pending_tool = Some((id, name, initial_input));
         }
         OutputContentBlock::Thinking { .. } => {}
@@ -12559,6 +12935,7 @@ fn response_to_events(
             false,
             stream_to_thread,
             expert_stream,
+            None,
         );
         if let Some((id, name, input)) = pending_tool.take() {
             thread.publish(
@@ -14666,31 +15043,33 @@ mod tests {
         delete_service_skill_file, discover_allowed_roots, ensure_mutation_rate_limit,
         ensure_run_capacity, ensure_thread_capacity, execute_artifact_emit,
         execute_expert_panel_emit, expert_run_response_from_audit, get_expert_panel_run,
-        import_legacy_thread_records, list_service_skills, load_threads, mutation_user_scope_key,
+        import_legacy_thread_records, list_service_skills, load_threads,
+        map_tool_result_to_agent_updates, mutation_user_scope_key,
         normalize_expert_panel_run_request, normalize_project_default_skill_names, normalize_terms,
         parse_bootstrap_api_keys, parse_limit_env, parse_run_timeout_secs,
         parse_skill_starter_prompt_from_contents, parse_skill_tags_from_contents, parse_user_id,
         persist_expert_run_state, persist_research_task_state, persist_thread_state,
         post_thread_command, provider_client_from_record, provider_kind_for_model_access,
-        render_skill_prompt, request_model_for_model_access, resolve_es_access,
-        resolve_service_skill, rewrite_tool_input, sqlite_path_from_url, thread_is_visible_to_auth,
-        ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord, AuditRecord, AuthContext,
-        AuthMode, CapacityUsage, CommandRequest, DataSourceKind, DataSourceRecord, EsConfig,
-        ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest, ExpertPanelRunExpertState,
-        ExpertPanelRunRequest, ExpertPanelRunResponse, ExpertPanelRunStatus, KnowledgeBaseRecord,
-        ManagedThread, MemoryNote, MemoryScope, MemorySearchScope, MessageBlockSnapshot,
-        ModelAccessConfig, MutationRateLimiter, MutationRateUsage, ProjectRecord, ProviderKind,
-        ResearchTaskStage, ResearchTaskStateRecord, ResolvedDataAccess, ResolvedDbAccess,
-        ResolvedDocumentAccess, ResolvedWebAccess, RunKind, RunRequest, SkillScope, ThreadRecord,
-        ThreadState, ThreadStatus, ThreadStore, UpdateProjectRequest,
-        CURRENT_DATABASE_SCHEMA_VERSION, MAX_VISIBLE_AUDIT_RECORDS,
+        render_skill_prompt, renumber_agent_tool_updates, request_model_for_model_access,
+        resolve_es_access, resolve_service_skill, rewrite_tool_input, sqlite_path_from_url,
+        thread_is_visible_to_auth, ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord,
+        AuditRecord, AuthContext, AuthMode, CapacityUsage, CommandRequest, DataSourceKind,
+        DataSourceRecord, EsConfig, ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest,
+        ExpertPanelRunExpertState, ExpertPanelRunRequest, ExpertPanelRunResponse,
+        ExpertPanelRunStatus, KnowledgeBaseRecord, ManagedThread, MemoryNote, MemoryScope,
+        MemorySearchScope, MessageBlockSnapshot, ModelAccessConfig, MutationRateLimiter,
+        MutationRateUsage, ProjectRecord, ProviderKind, ResearchTaskStage, ResearchTaskStateRecord,
+        ResolvedDataAccess, ResolvedDbAccess, ResolvedDocumentAccess, ResolvedEsAccess,
+        ResolvedWebAccess, RunKind, RunRequest, SkillScope, ThreadRecord, ThreadState,
+        ThreadStatus, ThreadStore, UpdateProjectRequest, CURRENT_DATABASE_SCHEMA_VERSION,
+        MAX_VISIBLE_AUDIT_RECORDS,
     };
     use crate::agent_turns::{
         AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
     };
     use crate::{
-        create_agent_conversation, create_expert_panel_run, create_thread, AuthQuery,
-        CreateAgentConversationRequest, CreateThreadRequest,
+        create_agent_conversation, create_expert_panel_run, create_thread, post_ag_ui_run,
+        AgUiRunRequest, AuthQuery, CreateAgentConversationRequest, CreateThreadRequest,
     };
     use api::InputContentBlock;
 
@@ -14826,6 +15205,73 @@ mod tests {
 
         assert_eq!(response.title, "台海供应链风险");
         assert_eq!(response.selected_expert_ids, vec!["howard-wang"]);
+    }
+
+    #[tokio::test]
+    async fn ag_ui_run_persists_forwarded_tool_citations_inside_turn() {
+        let temp_dir = test_temp_dir("ag-ui-forwarded-tool-citations");
+        let state = Arc::new(AppState::new(Arc::new(test_config(temp_dir))).expect("state"));
+        let conversation = AgentConversationRecord {
+            id: "conv-forwarded-tool".to_string(),
+            tenant_id: None,
+            owner_id: "alice".to_string(),
+            title: "检索测试".to_string(),
+            status: AgentConversationStatus::Idle,
+            selected_knowledge_base_ids: Vec::new(),
+            selected_data_source_ids: Vec::new(),
+            selected_expert_ids: Vec::new(),
+            model_profile_id: None,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+        };
+        state
+            .store
+            .upsert_agent_conversation(&conversation)
+            .expect("persist conversation");
+
+        let _response = post_ag_ui_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AuthQuery {
+                user_id: Some("alice".to_string()),
+                api_key: None,
+            }),
+            Json(AgUiRunRequest {
+                thread_id: "conv-forwarded-tool".to_string(),
+                run_id: "turn-forwarded-tool".to_string(),
+                messages: vec![json!({
+                    "role": "user",
+                    "content": "检索台海供应链"
+                })],
+                state: Value::Null,
+                context: Vec::new(),
+                forwarded_props: json!({
+                    "toolResults": [{
+                        "toolCallId": "tool-1",
+                        "toolName": "EsSearch",
+                        "input": { "query": "台海供应链" },
+                        "output": {
+                            "hits": [{
+                                "title": "供应链报告",
+                                "preview": "港口风险上升",
+                                "location": "military-index#1"
+                            }]
+                        }
+                    }]
+                }),
+            }),
+        )
+        .await
+        .expect("post ag ui run");
+
+        let turns = state
+            .store
+            .list_agent_turns("conv-forwarded-tool", None, "alice")
+            .expect("list turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].steps[0].label, "资料检索已返回");
+        assert_eq!(turns[0].citations[0].number, 1);
+        assert_eq!(turns[0].citations[0].title.as_deref(), Some("供应链报告"));
     }
 
     fn spawn_openai_error_server(status: &str, body: &'static str) -> String {
@@ -15027,6 +15473,90 @@ mod tests {
             error: None,
             debug_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn es_search_tool_result_maps_to_public_retrieval_step_and_citation() {
+        let input = serde_json::json!({ "query": "台海供应链", "index": "military-index" });
+        let output = serde_json::json!({
+            "query": "台海供应链",
+            "index": "military-index",
+            "hits": [
+                {
+                    "title": "供应链报告",
+                    "preview": "港口风险上升",
+                    "location": "military-index#1",
+                    "score": 0.91
+                }
+            ]
+        })
+        .to_string();
+
+        let mapped = map_tool_result_to_agent_updates(
+            "tool-1",
+            "EsSearch",
+            &input.to_string(),
+            &output,
+            false,
+        );
+
+        assert_eq!(mapped.steps[0].label, "资料检索已返回");
+        assert_eq!(mapped.citations[0].number, 1);
+        assert_eq!(mapped.citations[0].title.as_deref(), Some("供应链报告"));
+        assert_eq!(mapped.debug_event.event_type, "TOOL_CALL_RESULT");
+    }
+
+    #[test]
+    fn source_search_hit_shape_maps_to_readable_citation_fields() {
+        let output = serde_json::json!({
+            "data_source_name": "个人上传",
+            "hits": [{
+                "_id": "file-1",
+                "_score": 3,
+                "_source": {
+                    "title": "供应链报告.pdf",
+                    "path": "uploads/supply-chain.pdf",
+                    "summary": "港口风险上升"
+                }
+            }]
+        })
+        .to_string();
+
+        let mapped =
+            map_tool_result_to_agent_updates("tool-source", "SourceSearch", "{}", &output, false);
+
+        assert_eq!(mapped.citations[0].source_label, "个人上传");
+        assert_eq!(mapped.citations[0].title.as_deref(), Some("供应链报告.pdf"));
+        assert_eq!(
+            mapped.citations[0].location.as_deref(),
+            Some("uploads/supply-chain.pdf")
+        );
+        assert_eq!(mapped.citations[0].preview, "港口风险上升");
+    }
+
+    #[test]
+    fn agent_tool_updates_are_renumbered_across_multiple_tool_results() {
+        let first = map_tool_result_to_agent_updates(
+            "tool-1",
+            "EsSearch",
+            "{}",
+            &serde_json::json!({ "hits": [{ "title": "A", "preview": "A", "location": "a#1" }] })
+                .to_string(),
+            false,
+        );
+        let second = map_tool_result_to_agent_updates(
+            "tool-2",
+            "EsSearch",
+            "{}",
+            &serde_json::json!({ "hits": [{ "title": "B", "preview": "B", "location": "b#1" }] })
+                .to_string(),
+            false,
+        );
+
+        let updates = renumber_agent_tool_updates(vec![first, second]);
+
+        assert_eq!(updates[0].citations[0].number, 1);
+        assert_eq!(updates[1].citations[0].number, 2);
     }
 
     #[test]
@@ -15535,6 +16065,7 @@ mod tests {
                 expert_run: None,
                 execution_context: None,
             },
+            &ResolvedEsAccess::default(),
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
             &ResolvedDbAccess::default(),
@@ -15585,6 +16116,7 @@ mod tests {
                 expert_run: None,
                 execution_context: None,
             },
+            &ResolvedEsAccess::default(),
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
             &ResolvedDbAccess::default(),
@@ -15614,6 +16146,7 @@ mod tests {
             question: None,
             source_message_id: None,
             knowledge_base_id: None,
+            data_source_ids: None,
             auto_retrieval: None,
             experts: experts.clone(),
             retry_count: None,
@@ -15626,6 +16159,7 @@ mod tests {
             question: Some("问题".to_string()),
             source_message_id: Some("msg-1".to_string()),
             knowledge_base_id: None,
+            data_source_ids: None,
             auto_retrieval: None,
             experts,
             retry_count: None,
@@ -15679,6 +16213,9 @@ mod tests {
         let request = normalize_expert_panel_run_request(ExpertPanelRunRequest {
             question: Some("问题".to_string()),
             source_message_id: None,
+            knowledge_base_id: Some("  kb-strategy  ".to_string()),
+            data_source_ids: None,
+            auto_retrieval: Some(false),
             experts: vec![ExpertPanelExpert {
                 skill: "mearsheimer".to_string(),
                 scope: SkillScope::Workspace,
@@ -15687,8 +16224,6 @@ mod tests {
             }],
             retry_count: Some(9),
             concurrency_limit: Some(99),
-            knowledge_base_id: Some("  kb-strategy  ".to_string()),
-            auto_retrieval: Some(false),
         })
         .expect("valid request");
 
@@ -15792,6 +16327,7 @@ mod tests {
                 expert_run: None,
                 execution_context: None,
             },
+            &ResolvedEsAccess::default(),
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
             &ResolvedDbAccess::default(),
@@ -16871,6 +17407,7 @@ mod tests {
                 content: "请总结当前资料".to_string(),
                 expert_panel: None,
                 knowledge_base_id: None,
+                data_source_ids: None,
                 auto_retrieval: None,
             }),
         )
@@ -16976,6 +17513,7 @@ mod tests {
                     }],
                 }),
                 knowledge_base_id: Some("kb-panel-alpha".to_string()),
+                data_source_ids: None,
                 auto_retrieval: Some(false),
             }),
         )
@@ -17077,6 +17615,7 @@ mod tests {
                 content: "请读取资料库".to_string(),
                 expert_panel: None,
                 knowledge_base_id: Some("kb-missing".to_string()),
+                data_source_ids: None,
                 auto_retrieval: Some(true),
             }),
         )
@@ -17143,6 +17682,7 @@ mod tests {
                 question: Some("请组织专家讨论".to_string()),
                 source_message_id: None,
                 knowledge_base_id: Some(inaccessible_kb.id.clone()),
+                data_source_ids: None,
                 auto_retrieval: Some(true),
                 experts: vec![ExpertPanelExpert {
                     skill: "mearsheimer".to_string(),
@@ -17213,6 +17753,7 @@ mod tests {
                 question: Some("请组织专家讨论".to_string()),
                 source_message_id: None,
                 knowledge_base_id: None,
+                data_source_ids: None,
                 auto_retrieval: Some(true),
                 experts: vec![ExpertPanelExpert {
                     skill: "mearsheimer".to_string(),
@@ -17518,6 +18059,7 @@ mod tests {
                 question: Some("请组织专家讨论".to_string()),
                 source_message_id: None,
                 knowledge_base_id: Some(knowledge_base.id.clone()),
+                data_source_ids: None,
                 auto_retrieval: Some(false),
                 experts: vec![ExpertPanelExpert {
                     skill: "mearsheimer".to_string(),
