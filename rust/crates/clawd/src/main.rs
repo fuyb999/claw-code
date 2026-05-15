@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::net::SocketAddr;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -13,11 +13,10 @@ pub mod agent_turns;
 use crate::agent_turns::{
     AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
 };
-
 use api::{
-    model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig,
-    OutputContentBlock, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    model_family_identity_for, AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
+    ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolResultContentBlock,
 };
 use async_stream::stream;
@@ -40,8 +39,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client as PostgresClient, NoTls, Transaction as PostgresTransaction};
-use tools::{GlobalToolRegistry, RuntimeToolDefinition};
 use tools::pdf_extract;
+use tools::{GlobalToolRegistry, RuntimeToolDefinition};
 use tower_http::cors::{Any, CorsLayer};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SAFE_BUILTIN_TOOLS: &[&str] = &["read_file", "glob_search", "grep_search"];
@@ -80,24 +79,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/v1/api-keys/:id/disable", post(disable_api_key))
             .route("/v1/projects", get(list_projects).post(create_project))
             .route("/v1/projects/:id", get(get_project).patch(update_project))
-            .route("/v1/knowledge-bases", get(list_knowledge_bases).post(create_knowledge_base))
-            .route("/v1/data-sources", get(list_data_sources).post(create_data_source))
+            .route(
+                "/v1/knowledge-bases",
+                get(list_knowledge_bases).post(create_knowledge_base),
+            )
+            .route(
+                "/v1/knowledge-bases/:id",
+                delete(delete_knowledge_base),
+            )
+            .route(
+                "/v1/data-sources",
+                get(list_data_sources).post(create_data_source),
+            )
             .route("/v1/data-sources/test", post(test_data_source))
             .route("/v1/data-sources/:id/test", post(test_saved_data_source))
-            .route("/v1/data-sources/:id", get(get_data_source).patch(update_data_source).delete(delete_data_source))
+            .route(
+                "/v1/data-sources/:id",
+                get(get_data_source)
+                    .patch(update_data_source)
+                    .delete(delete_data_source),
+            )
             .route("/v1/data-sources/:id/upload", post(upload_data_source_file))
-            .route("/v1/data-sources/:id/files/:file_id", delete(delete_data_source_file))
-            .route("/v1/acp-connectors", get(list_acp_connectors).post(create_acp_connector))
+            .route(
+                "/v1/data-sources/:id/files/:file_id",
+                delete(delete_data_source_file),
+            )
+            .route(
+                "/v1/acp-connectors",
+                get(list_acp_connectors).post(create_acp_connector),
+            )
             .route("/v1/acp-connectors/test", post(test_acp_connector))
             .route(
                 "/v1/acp-connectors/:id",
-                get(get_acp_connector).patch(update_acp_connector).delete(delete_acp_connector),
+                get(get_acp_connector)
+                    .patch(update_acp_connector)
+                    .delete(delete_acp_connector),
             )
-            .route("/v1/acp-connectors/:id/discover", post(discover_saved_acp_connector))
+            .route(
+                "/v1/acp-connectors/:id/discover",
+                post(discover_saved_acp_connector),
+            )
             .route("/v1/skills", get(list_skills).post(upsert_skill))
             .route("/v1/skills/:name", get(get_skill).delete(delete_skill))
             .route("/v1/threads", get(list_threads).post(create_thread))
-            .route("/v1/threads/:id", get(get_thread))
+            .route("/v1/threads/:id", get(get_thread).delete(delete_thread))
             .route("/v1/threads/:id/events", get(thread_events))
             .route(
                 "/v1/threads/:id/expert-panel-runs",
@@ -154,6 +179,7 @@ struct AppConfig {
     max_mutation_requests_per_minute_per_tenant: Option<usize>,
     max_mutation_requests_per_minute_per_user: Option<usize>,
     dev_user_header_auth_enabled: bool,
+    platform_admin_users: BTreeSet<String>,
     bootstrap_api_keys: Vec<SeedApiKey>,
     allowed_roots: Vec<PathBuf>,
     es: EsConfig,
@@ -240,6 +266,16 @@ impl AppConfig {
             .map(|value| parse_bool_env("CLAWD_ENABLE_DEV_USER_HEADER_AUTH", &value))
             .transpose()?
             .unwrap_or(true);
+        let platform_admin_users = std::env::var("CLAWD_PLATFORM_ADMIN_USERS")
+            .ok()
+            .map(|value| parse_identifier_csv(&value))
+            .transpose()?
+            .unwrap_or_default();
+        let platform_admin_users = if platform_admin_users.is_empty() {
+            BTreeSet::from(["admin".to_string()])
+        } else {
+            platform_admin_users
+        };
         let bootstrap_api_keys = std::env::var("CLAWD_BOOTSTRAP_API_KEYS")
             .ok()
             .map(|value| parse_bootstrap_api_keys(&value))
@@ -276,6 +312,7 @@ impl AppConfig {
             max_mutation_requests_per_minute_per_tenant,
             max_mutation_requests_per_minute_per_user,
             dev_user_header_auth_enabled,
+            platform_admin_users,
             bootstrap_api_keys,
             allowed_roots,
             es: EsConfig::from_env(),
@@ -325,6 +362,18 @@ struct SeedApiKey {
 
 fn default_database_url(data_dir: &Path) -> String {
     format!("sqlite://{}", data_dir.join("clawd.db").display())
+}
+
+fn parse_identifier_csv(raw: &str) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
+    let mut values = BTreeSet::new();
+    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        values.insert(parse_user_id(item)?);
+    }
+    Ok(values)
+}
+
+fn is_platform_admin(config: &AppConfig, auth: &AuthContext) -> bool {
+    config.platform_admin_users.contains(auth.user_id.as_str())
 }
 
 fn data_source_storage_dir(config: &AppConfig, source: &DataSourceRecord) -> PathBuf {
@@ -406,7 +455,11 @@ fn sanitize_upload_file_name(file_name: &str) -> String {
     }
 }
 
-fn remove_uploaded_document_file(config: &AppConfig, source: &DataSourceRecord, file: &DocumentFileRecord) {
+fn remove_uploaded_document_file(
+    config: &AppConfig,
+    source: &DataSourceRecord,
+    file: &DocumentFileRecord,
+) {
     let stored_path = data_source_storage_dir(config, source).join(&file.stored_name);
     match fs::remove_file(&stored_path) {
         Ok(()) => {}
@@ -568,6 +621,7 @@ impl AppState {
     fn new(config: Arc<AppConfig>) -> Result<Self, Box<dyn std::error::Error>> {
         let store = Arc::new(ThreadStore::open(&config)?);
         seed_bootstrap_api_keys(&store, &config.bootstrap_api_keys)?;
+        promote_legacy_dev_platform_records(&store, &config)?;
         import_legacy_thread_records(&store, &config)?;
         let mut threads = HashMap::new();
         for managed in load_threads(&store)? {
@@ -596,6 +650,106 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(thread.id().to_string(), thread);
     }
+}
+
+fn promote_legacy_dev_platform_records(
+    store: &ThreadStore,
+    config: &AppConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !config.dev_user_header_auth_enabled {
+        return Ok(());
+    }
+
+    let projects = store.load_projects()?;
+    for mut record in projects {
+        if !project_should_promote_to_platform(config, &record) {
+            continue;
+        }
+        record.owner_id = None;
+        record.updated_at_ms = now_millis();
+        store.upsert_project(&record)?;
+    }
+
+    let data_sources = store.load_data_sources()?;
+    let mut promoted_knowledge_base_ids = BTreeSet::new();
+    for mut record in data_sources {
+        if !data_source_should_promote_to_platform(config, &record) {
+            continue;
+        }
+        record.owner_id = None;
+        record.updated_at_ms = now_millis();
+        promoted_knowledge_base_ids.insert(record.knowledge_base_id.clone());
+        store.upsert_data_source(&record)?;
+    }
+
+    let knowledge_bases = store.load_knowledge_bases()?;
+    for mut record in knowledge_bases {
+        if !knowledge_base_should_promote_to_platform(
+            config,
+            &record,
+            promoted_knowledge_base_ids.contains(&record.id),
+        ) {
+            continue;
+        }
+        record.owner_id = None;
+        record.updated_at_ms = now_millis();
+        store.upsert_knowledge_base(&record)?;
+    }
+
+    let acp_connectors = store.load_acp_connectors()?;
+    for mut record in acp_connectors {
+        if !acp_connector_should_promote_to_platform(config, &record) {
+            continue;
+        }
+        record.owner_id = None;
+        record.updated_at_ms = now_millis();
+        store.upsert_acp_connector(&record)?;
+    }
+
+    Ok(())
+}
+
+fn legacy_dev_owner_id_is_platform_candidate(config: &AppConfig, owner_id: &str) -> bool {
+    config.platform_admin_users.contains(owner_id)
+        || matches!(owner_id, "1" | "admin" | "local-dev" | "admin-check")
+        || owner_id.starts_with("browser-")
+}
+
+fn project_should_promote_to_platform(config: &AppConfig, record: &ProjectRecord) -> bool {
+    record
+        .owner_id
+        .as_deref()
+        .is_some_and(|owner_id| legacy_dev_owner_id_is_platform_candidate(config, owner_id))
+}
+
+fn data_source_should_promote_to_platform(config: &AppConfig, record: &DataSourceRecord) -> bool {
+    record.kind != DataSourceKind::Upload
+        && record
+            .owner_id
+            .as_deref()
+            .is_some_and(|owner_id| legacy_dev_owner_id_is_platform_candidate(config, owner_id))
+}
+
+fn knowledge_base_should_promote_to_platform(
+    config: &AppConfig,
+    record: &KnowledgeBaseRecord,
+    has_promoted_source: bool,
+) -> bool {
+    has_promoted_source
+        && record
+            .owner_id
+            .as_deref()
+            .is_some_and(|owner_id| legacy_dev_owner_id_is_platform_candidate(config, owner_id))
+}
+
+fn acp_connector_should_promote_to_platform(
+    config: &AppConfig,
+    record: &AcpConnectorRecord,
+) -> bool {
+    record
+        .owner_id
+        .as_deref()
+        .is_some_and(|owner_id| legacy_dev_owner_id_is_platform_candidate(config, owner_id))
 }
 
 #[derive(Debug, Clone)]
@@ -654,6 +808,10 @@ enum PostgresRequest {
         record: ThreadRecord,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    DeleteRecord {
+        id: String,
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
     UpsertProject {
         record: ProjectRecord,
         reply: mpsc::Sender<Result<(), String>>,
@@ -661,6 +819,10 @@ enum PostgresRequest {
     UpsertKnowledgeBase {
         record: KnowledgeBaseRecord,
         reply: mpsc::Sender<Result<(), String>>,
+    },
+    DeleteKnowledgeBase {
+        id: String,
+        reply: mpsc::Sender<Result<bool, String>>,
     },
     UpsertDataSource {
         record: DataSourceRecord,
@@ -699,19 +861,23 @@ enum PostgresRequest {
         now_ms: u64,
         reply: mpsc::Sender<Result<bool, String>>,
     },
+    #[allow(dead_code)]
     UpsertAgentConversation {
         record: AgentConversationRecord,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    #[allow(dead_code)]
     UpsertAgentTurn {
         record: AgentTurnRecord,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    #[allow(dead_code)]
     ListAgentConversations {
         tenant_id: Option<String>,
         owner_id: String,
         reply: mpsc::Sender<Result<Vec<AgentConversationRecord>, String>>,
     },
+    #[allow(dead_code)]
     ListAgentTurns {
         conversation_id: String,
         tenant_id: Option<String>,
@@ -821,6 +987,12 @@ impl PostgresWorker {
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);
                     }
+                    PostgresRequest::DeleteRecord { id, reply } => {
+                        let result = runtime
+                            .block_on(postgres_delete_record(&client, &id))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
                     PostgresRequest::UpsertProject { record, reply } => {
                         let result = runtime
                             .block_on(postgres_upsert_project(&client, &record))
@@ -830,6 +1002,12 @@ impl PostgresWorker {
                     PostgresRequest::UpsertKnowledgeBase { record, reply } => {
                         let result = runtime
                             .block_on(postgres_upsert_knowledge_base(&client, &record))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    PostgresRequest::DeleteKnowledgeBase { id, reply } => {
+                        let result = runtime
+                            .block_on(postgres_delete_knowledge_base(&client, &id))
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);
                     }
@@ -1014,9 +1192,7 @@ impl PostgresWorker {
                     } => {
                         let result = runtime
                             .block_on(load_postgres_latest_expert_panel_run_state(
-                                &client,
-                                &thread_id,
-                                &run_id,
+                                &client, &thread_id, &run_id,
                             ))
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);
@@ -1058,6 +1234,20 @@ impl PostgresWorker {
             .map_err(boxed_string_error)
     }
 
+    fn delete_record(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::DeleteRecord {
+                id: id.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
     fn upsert_project(&self, record: &ProjectRecord) -> Result<(), Box<dyn std::error::Error>> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.sender
@@ -1080,6 +1270,20 @@ impl PostgresWorker {
         self.sender
             .send(PostgresRequest::UpsertKnowledgeBase {
                 record: record.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
+        reply_rx
+            .recv()
+            .map_err(|error| boxed_string_error(format!("postgres response failed: {error}")))?
+            .map_err(boxed_string_error)
+    }
+
+    fn delete_knowledge_base(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(PostgresRequest::DeleteKnowledgeBase {
+                id: id.to_string(),
                 reply: reply_tx,
             })
             .map_err(|error| boxed_string_error(format!("postgres request failed: {error}")))?;
@@ -1273,6 +1477,7 @@ impl PostgresWorker {
             .map_err(boxed_string_error)
     }
 
+    #[allow(dead_code)]
     fn upsert_agent_conversation(
         &self,
         record: &AgentConversationRecord,
@@ -1290,6 +1495,7 @@ impl PostgresWorker {
             .map_err(boxed_string_error)
     }
 
+    #[allow(dead_code)]
     fn upsert_agent_turn(
         &self,
         record: &AgentTurnRecord,
@@ -1307,6 +1513,7 @@ impl PostgresWorker {
             .map_err(boxed_string_error)
     }
 
+    #[allow(dead_code)]
     fn list_agent_conversations(
         &self,
         tenant_id: Option<&str>,
@@ -1326,6 +1533,7 @@ impl PostgresWorker {
             .map_err(boxed_string_error)
     }
 
+    #[allow(dead_code)]
     fn list_agent_turns(
         &self,
         conversation_id: &str,
@@ -1567,6 +1775,24 @@ impl ThreadStore {
         Ok(())
     }
 
+    fn delete_thread(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let mut guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let transaction = guard.transaction()?;
+                transaction.execute("DELETE FROM audit_records WHERE thread_id = ?1", [id])?;
+                transaction.execute("DELETE FROM artifact_records WHERE thread_id = ?1", [id])?;
+                transaction.execute("DELETE FROM memory_notes WHERE thread_id = ?1", [id])?;
+                let affected = transaction.execute("DELETE FROM thread_records WHERE id = ?1", [id])?;
+                transaction.commit()?;
+                Ok(affected > 0)
+            }
+            Self::Postgres { worker, .. } => worker.delete_record(id),
+        }
+    }
+
     fn upsert_project(&self, record: &ProjectRecord) -> Result<(), Box<dyn std::error::Error>> {
         let tenant_id = record.tenant_id.clone();
         let owner_id = record.owner_id.clone();
@@ -1646,7 +1872,23 @@ impl ThreadStore {
         Ok(())
     }
 
-    fn upsert_data_source(&self, record: &DataSourceRecord) -> Result<(), Box<dyn std::error::Error>> {
+    fn delete_knowledge_base(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        match self {
+            Self::Sqlite { connection, .. } => {
+                let guard = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let affected = guard.execute("DELETE FROM knowledge_bases WHERE id = ?1", [id])?;
+                Ok(affected > 0)
+            }
+            Self::Postgres { worker, .. } => worker.delete_knowledge_base(id),
+        }
+    }
+
+    fn upsert_data_source(
+        &self,
+        record: &DataSourceRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let tenant_id = record.tenant_id.clone();
         let owner_id = record.owner_id.clone();
         let updated_at_ms = i64::try_from(record.updated_at_ms)?;
@@ -1819,6 +2061,7 @@ impl ThreadStore {
         }
     }
 
+    #[allow(dead_code)]
     fn upsert_agent_conversation(
         &self,
         record: &AgentConversationRecord,
@@ -1855,6 +2098,7 @@ impl ThreadStore {
         }
     }
 
+    #[allow(dead_code)]
     fn upsert_agent_turn(
         &self,
         record: &AgentTurnRecord,
@@ -1898,6 +2142,7 @@ impl ThreadStore {
         }
     }
 
+    #[allow(dead_code)]
     fn list_agent_conversations(
         &self,
         tenant_id: Option<&str>,
@@ -1928,6 +2173,7 @@ impl ThreadStore {
         }
     }
 
+    #[allow(dead_code)]
     fn list_agent_turns(
         &self,
         conversation_id: &str,
@@ -2038,9 +2284,8 @@ impl ThreadStore {
                 let guard = connection
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut statement = guard.prepare(
-                    "SELECT record_json FROM data_sources ORDER BY updated_at_ms DESC",
-                )?;
+                let mut statement = guard
+                    .prepare("SELECT record_json FROM data_sources ORDER BY updated_at_ms DESC")?;
                 let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
                 let mut records = Vec::new();
                 for row in rows {
@@ -2186,7 +2431,9 @@ impl ThreadStore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 load_sqlite_latest_expert_panel_run_state(&guard, thread_id, run_id)
             }
-            Self::Postgres { worker, .. } => worker.load_latest_expert_panel_run_state(thread_id, run_id),
+            Self::Postgres { worker, .. } => {
+                worker.load_latest_expert_panel_run_state(thread_id, run_id)
+            }
         }
     }
 
@@ -3834,6 +4081,35 @@ async fn postgres_delete_data_source(
     Ok(affected > 0)
 }
 
+async fn postgres_delete_knowledge_base(
+    client: &PostgresClient,
+    id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let affected = client
+        .execute("DELETE FROM knowledge_bases WHERE id = $1", &[&id])
+        .await?;
+    Ok(affected > 0)
+}
+
+async fn postgres_delete_record(
+    client: &PostgresClient,
+    id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    client
+        .execute("DELETE FROM audit_records WHERE thread_id = $1", &[&id])
+        .await?;
+    client
+        .execute("DELETE FROM artifact_records WHERE thread_id = $1", &[&id])
+        .await?;
+    client
+        .execute("DELETE FROM memory_notes WHERE thread_id = $1", &[&id])
+        .await?;
+    let affected = client
+        .execute("DELETE FROM thread_records WHERE id = $1", &[&id])
+        .await?;
+    Ok(affected > 0)
+}
+
 async fn postgres_upsert_acp_connector(
     _client: &PostgresClient,
     _record: &AcpConnectorRecord,
@@ -4547,6 +4823,7 @@ struct ResolvedEsAccess {
     username: Option<String>,
     password: Option<String>,
     default_index: Option<String>,
+    indices: Vec<String>,
     source_id: Option<String>,
     source_name: Option<String>,
 }
@@ -4671,6 +4948,13 @@ struct ExpertExecutionFailure {
     error: String,
 }
 
+#[derive(Debug, Clone)]
+struct ExpertStreamContext {
+    run_id: String,
+    expert: ExpertPanelExpert,
+    attempt: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExpertPanelRunRequest {
     #[serde(default)]
@@ -4679,6 +4963,8 @@ struct ExpertPanelRunRequest {
     source_message_id: Option<String>,
     #[serde(default)]
     knowledge_base_id: Option<String>,
+    #[serde(default)]
+    data_source_ids: Option<Vec<String>>,
     #[serde(default)]
     auto_retrieval: Option<bool>,
     experts: Vec<ExpertPanelExpert>,
@@ -4692,6 +4978,8 @@ struct ExpertPanelRunRequest {
 struct RunExecutionContext {
     #[serde(default)]
     knowledge_base_id: Option<String>,
+    #[serde(default)]
+    data_source_ids: Option<Vec<String>>,
     #[serde(default)]
     knowledge_base_name: Option<String>,
     #[serde(default)]
@@ -4830,6 +5118,46 @@ struct AuditRecord {
     payload: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResearchTaskStage {
+    Question,
+    Retrieval,
+    ExpertReview,
+    Synthesis,
+    WritingReady,
+}
+
+impl ResearchTaskStage {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Question => "问题已记录",
+            Self::Retrieval => "资料检索中",
+            Self::ExpertReview => "专家复评中",
+            Self::Synthesis => "已形成综合判断",
+            Self::WritingReady => "可进入写作整理",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResearchTaskStageRecord {
+    stage: ResearchTaskStage,
+    label: String,
+    at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResearchTaskStateRecord {
+    id: String,
+    title: String,
+    status: ResearchTaskStage,
+    status_label: String,
+    next_recommended_action: String,
+    available_actions: Vec<String>,
+    stage_history: Vec<ResearchTaskStageRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ArtifactKind {
@@ -4926,7 +5254,7 @@ struct CreateThreadRequest {
 struct CreateProjectRequest {
     name: String,
     description: Option<String>,
-    workspace_root: String,
+    workspace_root: Option<String>,
     default_topic: Option<String>,
     default_model: Option<String>,
     model_base_url: Option<String>,
@@ -5219,6 +5547,8 @@ enum CommandRequest {
         #[serde(default)]
         knowledge_base_id: Option<String>,
         #[serde(default)]
+        data_source_ids: Option<Vec<String>>,
+        #[serde(default)]
         auto_retrieval: Option<bool>,
     },
     Interrupt {
@@ -5300,11 +5630,7 @@ async fn serve_web_asset(
     };
 
     let mime = content_type_for_path(&asset_path);
-    (
-        [(header::CONTENT_TYPE, mime)],
-        body,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, mime)], body).into_response()
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -5376,6 +5702,7 @@ struct AuthSessionResponse {
     api_key_id: Option<String>,
     api_key_prefix: Option<String>,
     display_name: Option<String>,
+    is_platform_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5955,23 +6282,24 @@ fn is_xai_base_url(base_url: &str) -> bool {
     base_url.to_ascii_lowercase().contains("x.ai")
 }
 
-fn openai_compat_api_key_from_env(config: OpenAiCompatConfig, base_url: Option<&str>) -> Option<String> {
-    read_env_non_empty(config.api_key_env)
-        .or_else(|| {
-            if config.provider_name == "OpenAI" && !base_url.is_some_and(is_anthropic_base_url) {
-                read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
-                    .or_else(|| read_env_non_empty("ANTHROPIC_API_KEY"))
-            } else {
-                None
-            }
-        })
+fn openai_compat_api_key_from_env(
+    config: OpenAiCompatConfig,
+    base_url: Option<&str>,
+) -> Option<String> {
+    read_env_non_empty(config.api_key_env).or_else(|| {
+        if config.provider_name == "OpenAI" && !base_url.is_some_and(is_anthropic_base_url) {
+            read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
+                .or_else(|| read_env_non_empty("ANTHROPIC_API_KEY"))
+        } else {
+            None
+        }
+    })
 }
 
 fn openai_compat_base_url_from_env(config: OpenAiCompatConfig) -> Option<String> {
     read_env_non_empty(config.base_url_env).or_else(|| {
         if config.provider_name == "OpenAI" {
-            read_env_non_empty("ANTHROPIC_BASE_URL")
-                .filter(|value| !is_anthropic_base_url(value))
+            read_env_non_empty("ANTHROPIC_BASE_URL").filter(|value| !is_anthropic_base_url(value))
         } else {
             None
         }
@@ -6019,8 +6347,9 @@ fn openai_compat_model_for_base_url(base_url: Option<&str>) -> String {
         Some(url) if is_xai_base_url(url) => {
             read_env_non_empty("XAI_MODEL").unwrap_or_else(|| "grok-3".to_string())
         }
-        _ => read_env_non_empty("OPENAI_MODEL")
-            .unwrap_or_else(|| "openai/gpt-4.1-mini".to_string()),
+        _ => {
+            read_env_non_empty("OPENAI_MODEL").unwrap_or_else(|| "openai/gpt-4.1-mini".to_string())
+        }
     }
 }
 
@@ -6039,7 +6368,9 @@ fn request_model_for_model_access(
     if detected == ProviderKind::Anthropic && has_non_anthropic_base_url {
         return match provider_kind {
             ProviderKind::OpenAi => openai_compat_model_for_base_url(base_url),
-            ProviderKind::Xai => read_env_non_empty("XAI_MODEL").unwrap_or_else(|| "grok-3".to_string()),
+            ProviderKind::Xai => {
+                read_env_non_empty("XAI_MODEL").unwrap_or_else(|| "grok-3".to_string())
+            }
             ProviderKind::Anthropic => resolved_model,
         };
     }
@@ -6071,10 +6402,12 @@ fn provider_client_from_record(record: &ThreadRecord) -> Result<ProviderClient, 
             )
         })?;
         let client = OpenAiCompatClient::new(key, config);
-        return Ok(ProviderClient::OpenAi(match openai_compat_base_url_from_env(config) {
-            Some(url) => client.with_base_url(url),
-            None => client,
-        }));
+        return Ok(ProviderClient::OpenAi(
+            match openai_compat_base_url_from_env(config) {
+                Some(url) => client.with_base_url(url),
+                None => client,
+            },
+        ));
     }
 
     let provider_kind = provider_kind_for_model_access(&record.model, base_url.as_deref());
@@ -6092,7 +6425,9 @@ fn provider_client_from_record(record: &ThreadRecord) -> Result<ProviderClient, 
         ProviderKind::Xai => {
             let key = api_key
                 .or_else(|| std::env::var("XAI_API_KEY").ok())
-                .ok_or_else(|| "missing xAI credentials; configure model API key or XAI_API_KEY".to_string())?;
+                .ok_or_else(|| {
+                    "missing xAI credentials; configure model API key or XAI_API_KEY".to_string()
+                })?;
             let client = OpenAiCompatClient::new(key, OpenAiCompatConfig::xai());
             Ok(ProviderClient::Xai(match base_url {
                 Some(url) => client.with_base_url(url),
@@ -6470,6 +6805,7 @@ async fn get_auth_session(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<AuthSessionResponse>, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
+    let is_admin = is_platform_admin(&state.config, &auth);
     Ok(Json(AuthSessionResponse {
         auth_mode: auth.auth_mode,
         tenant_id: auth.tenant_id,
@@ -6477,6 +6813,7 @@ async fn get_auth_session(
         api_key_id: auth.api_key_id,
         api_key_prefix: auth.api_key_prefix,
         display_name: auth.display_name,
+        is_platform_admin: is_admin,
     }))
 }
 
@@ -6806,7 +7143,111 @@ fn project_matches_user_scope(
     tenant_id: Option<&str>,
     user_id: &str,
 ) -> bool {
-    record.owner_id.as_deref() == Some(user_id) && project_matches_tenant_scope(record, tenant_id)
+    if !project_matches_tenant_scope(record, tenant_id) {
+        return false;
+    }
+    match record.owner_id.as_deref() {
+        Some(owner_id) => owner_id == user_id,
+        None => true,
+    }
+}
+
+fn project_matches_platform_scope(record: &ProjectRecord, tenant_id: Option<&str>) -> bool {
+    record.owner_id.is_none() && project_matches_tenant_scope(record, tenant_id)
+}
+
+fn project_is_visible_to_auth(
+    config: &AppConfig,
+    record: &ProjectRecord,
+    auth: &AuthContext,
+) -> bool {
+    if is_platform_admin(config, auth) {
+        return project_matches_platform_scope(record, auth.tenant_id.as_deref());
+    }
+    project_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id)
+}
+
+fn knowledge_base_matches_tenant_scope(
+    record: &KnowledgeBaseRecord,
+    tenant_id: Option<&str>,
+) -> bool {
+    match (record.tenant_id.as_deref(), tenant_id) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn knowledge_base_matches_user_scope(
+    record: &KnowledgeBaseRecord,
+    tenant_id: Option<&str>,
+    user_id: &str,
+) -> bool {
+    if !knowledge_base_matches_tenant_scope(record, tenant_id) {
+        return false;
+    }
+    match record.owner_id.as_deref() {
+        Some(owner_id) => owner_id == user_id,
+        None => true,
+    }
+}
+
+fn knowledge_base_matches_platform_scope(
+    record: &KnowledgeBaseRecord,
+    tenant_id: Option<&str>,
+) -> bool {
+    record.owner_id.is_none() && knowledge_base_matches_tenant_scope(record, tenant_id)
+}
+
+fn knowledge_base_is_visible_to_auth(
+    config: &AppConfig,
+    record: &KnowledgeBaseRecord,
+    auth: &AuthContext,
+) -> bool {
+    if is_platform_admin(config, auth) {
+        return knowledge_base_matches_platform_scope(record, auth.tenant_id.as_deref());
+    }
+    knowledge_base_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id)
+}
+
+fn data_source_matches_tenant_scope(record: &DataSourceRecord, tenant_id: Option<&str>) -> bool {
+    match (record.tenant_id.as_deref(), tenant_id) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn data_source_matches_user_scope(
+    record: &DataSourceRecord,
+    tenant_id: Option<&str>,
+    user_id: &str,
+) -> bool {
+    if !data_source_matches_tenant_scope(record, tenant_id) {
+        return false;
+    }
+    match record.owner_id.as_deref() {
+        Some(owner_id) => owner_id == user_id,
+        None => true,
+    }
+}
+
+fn data_source_matches_platform_scope(
+    record: &DataSourceRecord,
+    tenant_id: Option<&str>,
+) -> bool {
+    record.owner_id.is_none() && data_source_matches_tenant_scope(record, tenant_id)
+}
+
+fn data_source_is_visible_to_auth(
+    config: &AppConfig,
+    record: &DataSourceRecord,
+    auth: &AuthContext,
+) -> bool {
+    if is_platform_admin(config, auth) {
+        return data_source_matches_platform_scope(record, auth.tenant_id.as_deref());
+    }
+    data_source_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id)
 }
 
 fn collect_capacity_usage<'a, I>(
@@ -7074,9 +7515,7 @@ async fn list_projects(
         .load_projects()
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
-        .filter(|record| {
-            project_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id)
-        })
+        .filter(|record| project_is_visible_to_auth(&state.config, record, &auth))
         .map(project_summary_from_record)
         .collect::<Vec<_>>();
     Ok(Json(json!({ "projects": projects })))
@@ -7094,7 +7533,7 @@ async fn get_project(
         .get_project(&id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "project not found"))?;
-    if !project_matches_user_scope(&project, auth.tenant_id.as_deref(), &auth.user_id) {
+    if !project_is_visible_to_auth(&state.config, &project, &auth) {
         return Err(AppError::new(StatusCode::NOT_FOUND, "project not found"));
     }
 
@@ -7113,7 +7552,7 @@ async fn list_knowledge_bases(
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let visible_sources = data_sources
         .into_iter()
-        .filter(|record| data_source_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id))
+        .filter(|record| data_source_is_visible_to_auth(&state.config, record, &auth))
         .collect::<Vec<_>>();
 
     let knowledge_bases = state
@@ -7121,7 +7560,7 @@ async fn list_knowledge_bases(
         .load_knowledge_bases()
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
-        .filter(|record| knowledge_base_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id))
+        .filter(|record| knowledge_base_is_visible_to_auth(&state.config, record, &auth))
         .map(|record| {
             let count = visible_sources
                 .iter()
@@ -7159,7 +7598,11 @@ async fn create_knowledge_base(
     let record = KnowledgeBaseRecord {
         id: generate_id("kb"),
         tenant_id: auth.tenant_id.clone(),
-        owner_id: Some(auth.user_id.clone()),
+        owner_id: if is_platform_admin(&state.config, &auth) {
+            None
+        } else {
+            Some(auth.user_id.clone())
+        },
         name: name.to_string(),
         description: normalize_optional_text(request.description),
         default_project_id: normalize_optional_text(request.default_project_id),
@@ -7175,6 +7618,84 @@ async fn create_knowledge_base(
     Ok(Json(knowledge_base_summary_from_record(record, 0)))
 }
 
+async fn delete_knowledge_base(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let _ = consume_mutation_rate_limit(&state, &auth)?;
+    let knowledge_base = state
+        .store
+        .get_knowledge_base(&id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"))?;
+    if !knowledge_base_is_visible_to_auth(&state.config, &knowledge_base, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "knowledge base not found",
+        ));
+    }
+
+    let linked_thread_exists = state
+        .store
+        .load_records()
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .any(|thread| thread.knowledge_base_id.as_deref() == Some(knowledge_base.id.as_str()));
+    if linked_thread_exists {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "knowledge base is still used by existing conversations",
+        ));
+    }
+
+    let linked_sources = state
+        .store
+        .load_data_sources()
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .filter(|item| item.knowledge_base_id == knowledge_base.id)
+        .collect::<Vec<_>>();
+    for source in linked_sources {
+        if source.kind == DataSourceKind::Upload {
+            let files =
+                object_array_config_value(&source.config, "files", parse_document_file_record);
+            for file in &files {
+                remove_uploaded_document_file(&state.config, &source, file);
+            }
+            let storage_dir = data_source_storage_dir(&state.config, &source);
+            if let Err(error) = fs::remove_dir_all(&storage_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "failed to remove data source storage {}: {}",
+                        source.id, error
+                    );
+                }
+            }
+        }
+
+        state
+            .store
+            .delete_data_source(&source.id)
+            .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+
+    let deleted = state
+        .store
+        .delete_knowledge_base(&knowledge_base.id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if !deleted {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "knowledge base not found",
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_data_sources(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -7186,7 +7707,7 @@ async fn list_data_sources(
         .load_data_sources()
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .into_iter()
-        .filter(|record| data_source_matches_user_scope(record, auth.tenant_id.as_deref(), &auth.user_id))
+        .filter(|record| data_source_is_visible_to_auth(&state.config, record, &auth))
         .map(data_source_summary_from_record)
         .collect();
     Ok(Json(DataSourceListResponse { data_sources }))
@@ -7206,8 +7727,11 @@ async fn get_data_source(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "data source not found"))?;
-    if !data_source_matches_user_scope(&record, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+    if !data_source_is_visible_to_auth(&state.config, &record, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
     Ok(Json(data_source_detail_from_record(record)))
 }
@@ -7233,8 +7757,11 @@ async fn create_data_source(
         .get_knowledge_base(&request.knowledge_base_id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"))?;
-    if !knowledge_base_matches_user_scope(&knowledge_base, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"));
+    if !knowledge_base_is_visible_to_auth(&state.config, &knowledge_base, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "knowledge base not found",
+        ));
     }
 
     let mut config = request.config.unwrap_or_else(|| json!({}));
@@ -7244,7 +7771,11 @@ async fn create_data_source(
         id: generate_id("source"),
         knowledge_base_id: request.knowledge_base_id,
         tenant_id: auth.tenant_id.clone(),
-        owner_id: Some(auth.user_id.clone()),
+        owner_id: if is_platform_admin(&state.config, &auth) {
+            None
+        } else {
+            Some(auth.user_id.clone())
+        },
         name: name.to_string(),
         kind: request.kind,
         description: normalize_optional_text(request.description),
@@ -7279,8 +7810,11 @@ async fn update_data_source(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "data source not found"))?;
-    if !data_source_matches_user_scope(&record, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+    if !data_source_is_visible_to_auth(&state.config, &record, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
 
     if let Some(name) = request.name {
@@ -7352,8 +7886,11 @@ async fn test_saved_data_source(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "data source not found"))?;
-    if !data_source_matches_user_scope(&record, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+    if !data_source_is_visible_to_auth(&state.config, &record, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
 
     let mut config = record.config.clone();
@@ -7385,12 +7922,12 @@ fn normalize_data_source_config(
     }
     match kind {
         DataSourceKind::LocalDir => {
-            let path = payload
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AppError::new(StatusCode::BAD_REQUEST, "local_dir data source requires config.path")
-                })?;
+            let path = payload.get("path").and_then(Value::as_str).ok_or_else(|| {
+                AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    "local_dir data source requires config.path",
+                )
+            })?;
             let canonical = canonicalize_workspace(path, config)?;
             payload["path"] = Value::String(canonical.display().to_string());
         }
@@ -7409,7 +7946,10 @@ fn normalize_data_source_config(
                 .or_else(|| string_config_value(payload, "endpoint"))
                 .or_else(|| string_config_value(payload, "base_url"))
                 .ok_or_else(|| {
-                    AppError::new(StatusCode::BAD_REQUEST, "db data source requires config.url")
+                    AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        "db data source requires config.url",
+                    )
                 })?;
             payload["url"] = Value::String(url);
         }
@@ -7430,8 +7970,27 @@ async fn create_project(
     Json(request): Json<CreateProjectRequest>,
 ) -> Result<Json<ProjectSummary>, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
-    let workspace_root = canonicalize_workspace(&request.workspace_root, &state.config)?;
     let _ = consume_mutation_rate_limit(&state, &auth)?;
+    let workspace_root = if let Some(requested_root) = request.workspace_root.as_deref() {
+        canonicalize_workspace(requested_root, &state.config)?
+    } else {
+        let managed_root = state
+            .config
+            .managed_workspace_root(auth.tenant_id.as_deref(), &auth.user_id)
+            .join(generate_id("project"));
+        fs::create_dir_all(&managed_root).map_err(|error| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create managed project workspace: {error}"),
+            )
+        })?;
+        managed_root.canonicalize().map_err(|error| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to prepare managed project workspace: {error}"),
+            )
+        })?
+    };
     let name = request.name.trim();
     if name.is_empty() {
         return Err(AppError::new(
@@ -7457,7 +8016,11 @@ async fn create_project(
     let project = ProjectRecord {
         id: generate_id("project"),
         tenant_id: auth.tenant_id.clone(),
-        owner_id: Some(auth.user_id.clone()),
+        owner_id: if is_platform_admin(&state.config, &auth) {
+            None
+        } else {
+            Some(auth.user_id.clone())
+        },
         name: name.to_string(),
         description: normalize_optional_text(request.description),
         workspace_root,
@@ -7499,8 +8062,11 @@ async fn upload_data_source_file(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "data source not found"))?;
-    if !data_source_matches_user_scope(&data_source, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+    if !data_source_is_visible_to_auth(&state.config, &data_source, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
     if data_source.kind != DataSourceKind::Upload {
         return Err(AppError::new(
@@ -7510,23 +8076,33 @@ async fn upload_data_source_file(
     }
 
     let mut uploaded: Option<UploadedDocumentSummary> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, format!("multipart read failed: {error}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("multipart read failed: {error}"),
+        )
+    })? {
         let file_name = field
             .file_name()
             .map(str::to_string)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "uploaded-document".to_string());
         let mime_type = field.content_type().map(str::to_string);
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, format!("failed to read uploaded file: {error}")))?;
-        let record = persist_uploaded_document(&state.config, &data_source, &file_name, mime_type.clone(), &bytes)?;
-        let mut files = object_array_config_value(&data_source.config, "files", parse_document_file_record);
+        let bytes = field.bytes().await.map_err(|error| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read uploaded file: {error}"),
+            )
+        })?;
+        let record = persist_uploaded_document(
+            &state.config,
+            &data_source,
+            &file_name,
+            mime_type.clone(),
+            &bytes,
+        )?;
+        let mut files =
+            object_array_config_value(&data_source.config, "files", parse_document_file_record);
         files.push(record.clone());
         data_source.config["files"] = serde_json::to_value(&files)
             .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -7547,7 +8123,9 @@ async fn upload_data_source_file(
         break;
     }
 
-    uploaded.ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "no file was uploaded")).map(Json)
+    uploaded
+        .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "no file was uploaded"))
+        .map(Json)
 }
 
 async fn delete_data_source(
@@ -7565,19 +8143,26 @@ async fn delete_data_source(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "data source not found"))?;
-    if !data_source_matches_user_scope(&data_source, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+    if !data_source_is_visible_to_auth(&state.config, &data_source, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
 
     if data_source.kind == DataSourceKind::Upload {
-        let files = object_array_config_value(&data_source.config, "files", parse_document_file_record);
+        let files =
+            object_array_config_value(&data_source.config, "files", parse_document_file_record);
         for file in &files {
             remove_uploaded_document_file(&state.config, &data_source, file);
         }
         let storage_dir = data_source_storage_dir(&state.config, &data_source);
         if let Err(error) = fs::remove_dir_all(&storage_dir) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("failed to remove data source storage {}: {}", data_source.id, error);
+                eprintln!(
+                    "failed to remove data source storage {}: {}",
+                    data_source.id, error
+                );
             }
         }
     }
@@ -7587,7 +8172,10 @@ async fn delete_data_source(
         .delete_data_source(&data_source.id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     if !deleted {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -7607,8 +8195,11 @@ async fn delete_data_source_file(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "data source not found"))?;
-    if !data_source_matches_user_scope(&data_source, auth.tenant_id.as_deref(), &auth.user_id) {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "data source not found"));
+    if !data_source_is_visible_to_auth(&state.config, &data_source, &auth) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "data source not found",
+        ));
     }
     if data_source.kind != DataSourceKind::Upload {
         return Err(AppError::new(
@@ -7617,7 +8208,8 @@ async fn delete_data_source_file(
         ));
     }
 
-    let mut files = object_array_config_value(&data_source.config, "files", parse_document_file_record);
+    let mut files =
+        object_array_config_value(&data_source.config, "files", parse_document_file_record);
     let index = files
         .iter()
         .position(|item| item.id == file_id)
@@ -7654,7 +8246,7 @@ async fn update_project(
         .get_project(&id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "project not found"))?;
-    if !project_matches_user_scope(&project, auth.tenant_id.as_deref(), &auth.user_id) {
+    if !project_is_visible_to_auth(&state.config, &project, &auth) {
         return Err(AppError::new(StatusCode::NOT_FOUND, "project not found"));
     }
 
@@ -7686,21 +8278,26 @@ async fn create_thread(
             .get_project(project_id)
             .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
             .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "project not found"))?;
-        if !project_matches_user_scope(&project, auth.tenant_id.as_deref(), &auth.user_id) {
+        if !project_is_visible_to_auth(&state.config, &project, &auth) {
             return Err(AppError::new(StatusCode::NOT_FOUND, "project not found"));
         }
         Some(project)
     } else {
         None
     };
-    let linked_knowledge_base = if let Some(knowledge_base_id) = request.knowledge_base_id.as_deref() {
+    let linked_knowledge_base = if let Some(knowledge_base_id) =
+        request.knowledge_base_id.as_deref()
+    {
         let knowledge_base = state
             .store
             .get_knowledge_base(knowledge_base_id)
             .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
             .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"))?;
-        if !knowledge_base_matches_user_scope(&knowledge_base, auth.tenant_id.as_deref(), &auth.user_id) {
-            return Err(AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"));
+        if !knowledge_base_is_visible_to_auth(&state.config, &knowledge_base, &auth) {
+            return Err(AppError::new(
+                StatusCode::NOT_FOUND,
+                "knowledge base not found",
+            ));
         }
         Some(knowledge_base)
     } else if let Some(project) = &linked_project {
@@ -7729,10 +8326,9 @@ async fn create_thread(
         if let Some(root) = knowledge_base.legacy_workspace_root.clone() {
             root
         } else {
-            let managed_root =
-                state
-                    .config
-                    .managed_workspace_root(auth.tenant_id.as_deref(), &auth.user_id);
+            let managed_root = state
+                .config
+                .managed_workspace_root(auth.tenant_id.as_deref(), &auth.user_id);
             fs::create_dir_all(&managed_root).map_err(|error| {
                 AppError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -7749,10 +8345,9 @@ async fn create_thread(
     } else if let Some(requested_root) = request.workspace_root.as_deref() {
         canonicalize_workspace(requested_root, &state.config)?
     } else {
-        let managed_root =
-            state
-                .config
-                .managed_workspace_root(auth.tenant_id.as_deref(), &auth.user_id);
+        let managed_root = state
+            .config
+            .managed_workspace_root(auth.tenant_id.as_deref(), &auth.user_id);
         fs::create_dir_all(&managed_root).map_err(|error| {
             AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7794,8 +8389,8 @@ async fn create_thread(
         request.model_api_key,
         None,
     );
-    let has_request_model_access = request_model_access.base_url.is_some()
-        || request_model_access.api_key.is_some();
+    let has_request_model_access =
+        request_model_access.base_url.is_some() || request_model_access.api_key.is_some();
     let permission_mode = request
         .permission_mode
         .as_deref()
@@ -7930,6 +8525,66 @@ async fn get_thread(
     Ok(Json(thread.snapshot()))
 }
 
+async fn delete_thread(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, AppError> {
+    let auth = resolve_auth_context(&state, &headers, &query)?;
+    let _ = consume_mutation_rate_limit(&state, &auth)?;
+    let thread = state
+        .get_thread(&id)
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {id}")))?;
+    ensure_thread_access(&thread, &auth)?;
+
+    {
+        let guard = thread
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.current_run.is_some() {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "thread is running; interrupt it before deleting",
+            ));
+        }
+    }
+
+    let snapshot = thread.snapshot();
+    let session_path = snapshot.session_path.clone();
+    let thread_id = snapshot.id.clone();
+    let deleted = state
+        .store
+        .delete_thread(&thread_id)
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if !deleted {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("thread not found: {thread_id}"),
+        ));
+    }
+
+    {
+        let mut threads = state
+            .threads
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        threads.remove(&thread_id);
+    }
+
+    if let Err(error) = fs::remove_file(&session_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "failed to remove session file for thread {}: {}",
+                thread_id, error
+            );
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn thread_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -7998,6 +8653,7 @@ async fn post_thread_command(
             content,
             expert_panel,
             knowledge_base_id,
+            data_source_ids,
             auto_retrieval,
         } => {
             let expert_panel = expert_panel
@@ -8014,6 +8670,15 @@ async fn post_thread_command(
                     expert_run: None,
                     execution_context: Some(RunExecutionContext {
                         knowledge_base_id: normalize_optional_text(knowledge_base_id),
+                        data_source_ids: data_source_ids
+                            .map(|items| {
+                                items
+                                    .into_iter()
+                                    .map(|item| item.trim().to_string())
+                                    .filter(|item| !item.is_empty())
+                                    .collect::<Vec<_>>()
+                            })
+                            .filter(|items| !items.is_empty()),
                         knowledge_base_name: None,
                         auto_retrieval,
                     }),
@@ -8125,7 +8790,10 @@ async fn create_expert_panel_run(
 ) -> Result<Json<ExpertPanelRunResponse>, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
     let thread = state.get_thread(&thread_id).ok_or_else(|| {
-        AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("thread not found: {thread_id}"),
+        )
     })?;
     ensure_thread_access(&thread, &auth)?;
     if let Err(error) = consume_mutation_rate_limit(&state, &auth) {
@@ -8179,6 +8847,7 @@ async fn create_expert_panel_run(
             expert_run: None,
             execution_context: Some(RunExecutionContext {
                 knowledge_base_id: request.knowledge_base_id.clone(),
+                data_source_ids: request.data_source_ids.clone(),
                 knowledge_base_name: None,
                 auto_retrieval: request.auto_retrieval,
             }),
@@ -8218,7 +8887,10 @@ async fn get_expert_panel_run(
 ) -> Result<Json<ExpertPanelRunResponse>, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
     let thread = state.get_thread(&thread_id).ok_or_else(|| {
-        AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("thread not found: {thread_id}"),
+        )
     })?;
     ensure_thread_access(&thread, &auth)?;
     let response = load_expert_run_response(&state, &thread, &run_id)?.ok_or_else(|| {
@@ -8242,7 +8914,10 @@ async fn expert_panel_run_events(
 ) -> Result<impl IntoResponse, AppError> {
     let auth = resolve_auth_context(&state, &headers, &query)?;
     let thread = state.get_thread(&thread_id).ok_or_else(|| {
-        AppError::new(StatusCode::NOT_FOUND, format!("thread not found: {thread_id}"))
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("thread not found: {thread_id}"),
+        )
     })?;
     ensure_thread_access(&thread, &auth)?;
     let initial = load_expert_run_response(&state, &thread, &run_id)?.ok_or_else(|| {
@@ -8477,6 +9152,7 @@ fn start_run(
                 .clone(),
         }),
     );
+    let _ = persist_research_task_state(&state, &thread);
     let snapshot = thread.snapshot();
     thread.publish("run_started", json!(snapshot.clone()));
 
@@ -8615,6 +9291,7 @@ fn finalize_run(
         Some(run_id),
         audit_payload,
     );
+    let _ = persist_research_task_state(&state, &thread);
     let publish_payload = thread.snapshot();
     thread.publish(publish_kind, json!(publish_payload.clone()));
     if let Some(request) = follow_up {
@@ -8754,7 +9431,9 @@ fn append_timeline_assistant_text(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .session
-            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text { text }]))?;
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text,
+            }]))?;
         guard.record.updated_at_ms = now_millis();
     }
     persist_thread_state(thread, store)?;
@@ -8868,19 +9547,27 @@ fn execute_single_expert_attempt(
     base_session: Session,
     abort_signal: HookAbortSignal,
     execution_context: Option<RunExecutionContext>,
+    stream_to_thread: bool,
+    expert_stream: Option<ExpertStreamContext>,
 ) -> Result<ExpertExecutionOutput, ExpertExecutionFailure> {
     let start_index = base_session.messages.len();
     let permission_mode = parse_permission_mode(&base_record.permission_mode)
         .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
     let tool_registry = build_tool_registry()
         .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
-    let data_access = resolve_thread_data_access(&state.store, &base_record)
-        .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string()))?;
+    let data_access = resolve_thread_data_access(
+        &state.store,
+        &base_record,
+        execution_context.as_ref(),
+    )
+    .map_err(|error| {
+        expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string())
+    })?;
     let es_access = resolve_es_access(&state.config.es, &data_access);
     let document_access = resolve_document_access(&data_access);
     let web_access = resolve_web_access(&data_access);
     let db_access = resolve_db_access(&data_access);
-    let allowed_tools = allowed_tool_names(
+    let mut allowed_tools = allowed_tool_names(
         &state.config,
         &tool_registry,
         &base_record,
@@ -8889,6 +9576,7 @@ fn execute_single_expert_attempt(
         &web_access,
         &db_access,
     );
+    restrict_expert_file_tools_for_es(&mut allowed_tools, &es_access);
     let policy = permission_policy(permission_mode, &tool_registry, &allowed_tools)
         .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
     let run_request = RunRequest {
@@ -8910,11 +9598,14 @@ fn execute_single_expert_attempt(
         &state.config,
         &base_record,
         &run_request,
+        &es_access,
         &document_access,
         &web_access,
         &db_access,
     )
-    .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string()))?;
+    .map_err(|error| {
+        expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string())
+    })?;
     let api_client = ServiceApiClient::new(
         &base_record,
         state.store.clone(),
@@ -8923,7 +9614,12 @@ fn execute_single_expert_attempt(
         thread.clone(),
         run_id,
         abort_signal.clone(),
-        false,
+        expert_stream.or(Some(ExpertStreamContext {
+            run_id: input.run_id.clone(),
+            expert: input.expert.clone(),
+            attempt: input.attempt,
+        })),
+        stream_to_thread,
     )
     .map_err(|error| expert_failure_from_error(input.expert.clone(), input.attempt, error))?;
     let tool_executor = ServiceToolExecutor::new(
@@ -9011,6 +9707,8 @@ fn execute_expert_with_retries(
             base_session.clone(),
             abort_signal.clone(),
             execution_context.clone(),
+            false,
+            None,
         );
         match result {
             Ok(output) => return Ok(output),
@@ -9019,7 +9717,11 @@ fn execute_expert_with_retries(
     }
 
     Err(last_failure.unwrap_or_else(|| {
-        expert_failure_from_error(expert, max_attempts, "expert failed without an error payload")
+        expert_failure_from_error(
+            expert,
+            max_attempts,
+            "expert failed without an error payload",
+        )
     }))
 }
 
@@ -9122,6 +9824,8 @@ fn synthesize_expert_outputs(
         base_session,
         abort_signal,
         execution_context,
+        true,
+        None,
     )
     .map_err(|failure| failure.error)?;
     Ok(format!("### Final synthesis\n\n{}", output.content.trim()))
@@ -9137,13 +9841,10 @@ fn execute_expert_panel_run(
             .shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let active = guard
-            .current_run
-            .as_ref()
-            .ok_or_else(|| RunFailure {
-                error: "expert panel run missing active state".to_string(),
-                outcome: current_run_outcome(&thread),
-            })?;
+        let active = guard.current_run.as_ref().ok_or_else(|| RunFailure {
+            error: "expert panel run missing active state".to_string(),
+            outcome: current_run_outcome(&thread),
+        })?;
         if active.run_id != run_id {
             return Err(RunFailure {
                 error: "stale expert panel run".to_string(),
@@ -9166,27 +9867,36 @@ fn execute_expert_panel_run(
         outcome: current_run_outcome(&thread),
     })?;
 
-    let execution_context =
-        resolve_run_execution_context(&state.store, &record, &request).map_err(|error| RunFailure {
+    let execution_context = resolve_run_execution_context(&state.store, &record, &request)
+        .map_err(|error| RunFailure {
             error: error.message.clone(),
             outcome: current_run_outcome(&thread),
         })?;
     let effective_record = effective_record_for_run(&record, execution_context.as_ref());
 
     let mut panel_state = load_expert_run_response_or_log(&state, &thread, &controls.run_id)
-        .unwrap_or_else(|| expert_run_initial_response(&record.id, &controls.run_id, &ExpertPanelRunRequest {
-            question: Some(request.prompt.clone()),
-            source_message_id: None,
-            knowledge_base_id: execution_context
-                .as_ref()
-                .and_then(|context| context.knowledge_base_id.clone()),
-            auto_retrieval: execution_context
-                .as_ref()
-                .and_then(|context| context.auto_retrieval),
-            experts: panel.experts.clone(),
-            retry_count: Some(controls.retry_count),
-            concurrency_limit: Some(controls.concurrency_limit),
-        }));
+        .unwrap_or_else(|| {
+            expert_run_initial_response(
+                &record.id,
+                &controls.run_id,
+                &ExpertPanelRunRequest {
+                    question: Some(request.prompt.clone()),
+                    source_message_id: None,
+                    knowledge_base_id: execution_context
+                        .as_ref()
+                        .and_then(|context| context.knowledge_base_id.clone()),
+                    data_source_ids: execution_context
+                        .as_ref()
+                        .and_then(|context| context.data_source_ids.clone()),
+                    auto_retrieval: execution_context
+                        .as_ref()
+                        .and_then(|context| context.auto_retrieval),
+                    experts: panel.experts.clone(),
+                    retry_count: Some(controls.retry_count),
+                    concurrency_limit: Some(controls.concurrency_limit),
+                },
+            )
+        });
     panel_state.status = ExpertPanelRunStatus::Running;
     let _ = persist_expert_run_state(&state, &thread, &panel_state);
 
@@ -9290,14 +10000,17 @@ fn execute_expert_panel_run(
         execution_context,
     )
     .unwrap_or_else(|_| format_fallback_expert_synthesis_message(&successes, &failures));
-    latest_session = append_timeline_assistant_text(&state.store, &thread, synthesis).map_err(
-        |error| RunFailure {
-            error: error.to_string(),
-            outcome: current_run_outcome(&thread),
-        },
-    )?;
+    latest_session =
+        append_timeline_assistant_text(&state.store, &thread, synthesis).map_err(|error| {
+            RunFailure {
+                error: error.to_string(),
+                outcome: current_run_outcome(&thread),
+            }
+        })?;
 
-    if let Some(mut final_state) = load_expert_run_response_or_log(&state, &thread, &controls.run_id) {
+    if let Some(mut final_state) =
+        load_expert_run_response_or_log(&state, &thread, &controls.run_id)
+    {
         final_state.status = if successes.is_empty() && !failures.is_empty() {
             ExpertPanelRunStatus::Failed
         } else {
@@ -9305,13 +10018,15 @@ fn execute_expert_panel_run(
         };
         for expert_state in &mut final_state.experts {
             if let Some(output) = successes.iter().find(|output| {
-                output.expert.skill == expert_state.skill && output.expert.scope == expert_state.scope
+                output.expert.skill == expert_state.skill
+                    && output.expert.scope == expert_state.scope
             }) {
                 expert_state.status = ExpertPanelExpertStatus::Succeeded;
                 expert_state.attempts = output.attempts;
                 expert_state.content = Some(output.content.clone());
             } else if let Some(failure) = failures.iter().find(|failure| {
-                failure.expert.skill == expert_state.skill && failure.expert.scope == expert_state.scope
+                failure.expert.skill == expert_state.skill
+                    && failure.expert.scope == expert_state.scope
             }) {
                 expert_state.status = ExpertPanelExpertStatus::Failed;
                 expert_state.attempts = failure.attempts;
@@ -9343,13 +10058,10 @@ fn execute_run(
             .shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let active = guard
-            .current_run
-            .as_ref()
-            .ok_or_else(|| RunFailure {
-                error: "run missing active state".to_string(),
-                outcome: current_run_outcome(&thread),
-            })?;
+        let active = guard.current_run.as_ref().ok_or_else(|| RunFailure {
+            error: "run missing active state".to_string(),
+            outcome: current_run_outcome(&thread),
+        })?;
         if active.run_id != run_id {
             return Err(RunFailure {
                 error: "stale run".to_string(),
@@ -9363,8 +10075,8 @@ fn execute_run(
             active.abort_signal.clone(),
         )
     };
-    let execution_context =
-        resolve_run_execution_context(&state.store, &record, &request).map_err(|error| RunFailure {
+    let execution_context = resolve_run_execution_context(&state.store, &record, &request)
+        .map_err(|error| RunFailure {
             error: error.message.clone(),
             outcome: current_run_outcome(&thread),
         })?;
@@ -9380,10 +10092,12 @@ fn execute_run(
         outcome: current_run_outcome(&thread),
     })?;
     let data_access =
-        resolve_thread_data_access(&state.store, &effective_record).map_err(|error| RunFailure {
-        error: error.to_string(),
-        outcome: current_run_outcome(&thread),
-    })?;
+        resolve_thread_data_access(&state.store, &effective_record, execution_context.as_ref()).map_err(|error| {
+            RunFailure {
+                error: error.to_string(),
+                outcome: current_run_outcome(&thread),
+            }
+        })?;
     let es_access = resolve_es_access(&state.config.es, &data_access);
     let document_access = resolve_document_access(&data_access);
     let web_access = resolve_web_access(&data_access);
@@ -9397,23 +10111,26 @@ fn execute_run(
         &web_access,
         &db_access,
     );
-    let policy = permission_policy(permission_mode, &tool_registry, &allowed_tools)
-        .map_err(|error| RunFailure {
-            error: error.to_string(),
-            outcome: current_run_outcome(&thread),
+    let policy =
+        permission_policy(permission_mode, &tool_registry, &allowed_tools).map_err(|error| {
+            RunFailure {
+                error: error.to_string(),
+                outcome: current_run_outcome(&thread),
+            }
         })?;
     let system_prompt = build_system_prompt(
         &state.config,
         &effective_record,
         &request,
+        &es_access,
         &document_access,
         &web_access,
         &db_access,
     )
     .map_err(|error| RunFailure {
-            error: error.to_string(),
-            outcome: current_run_outcome(&thread),
-        })?;
+        error: error.to_string(),
+        outcome: current_run_outcome(&thread),
+    })?;
     let api_client = ServiceApiClient::new(
         &effective_record,
         state.store.clone(),
@@ -9422,6 +10139,7 @@ fn execute_run(
         thread.clone(),
         run_id,
         abort_signal.clone(),
+        None,
         true,
     )
     .map_err(|error| RunFailure {
@@ -9467,13 +10185,15 @@ fn build_system_prompt(
     config: &AppConfig,
     record: &ThreadRecord,
     request: &RunRequest,
+    es_access: &ResolvedEsAccess,
     document_access: &ResolvedDocumentAccess,
     web_access: &ResolvedWebAccess,
     db_access: &ResolvedDbAccess,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let date = current_date_iso();
     let managed_root = config.managed_workspaces_dir();
-    let is_managed_chat_workspace = record.project_id.is_none() && record.workspace_root.starts_with(&managed_root);
+    let is_managed_chat_workspace =
+        record.project_id.is_none() && record.workspace_root.starts_with(&managed_root);
     let mut prompt = if is_managed_chat_workspace {
         runtime::SystemPromptBuilder::new()
             .with_os(std::env::consts::OS, "unknown")
@@ -9572,6 +10292,7 @@ This run is a structured multi-expert workflow.\n\
 - Do not merge experts into one paragraph. Produce one visible expert opinion per selected expert before final synthesis.\n\
 - For each selected expert, call `Skill` with that expert skill name, follow its retrieval guidance, then emit a dedicated expert result card.\n\
 - If the current thread has connected sources, each expert should search those sources independently instead of reusing another expert's conclusion as evidence.\n\
+- When Elasticsearch sources are connected, each expert should call `EsSearch` before using workspace file tools. Do not treat local code or prompt files as primary evidence for a research question.\n\
 - The user should see expert opinions and the final synthesis, but should not see hidden orchestration text, internal prompts, or raw skill payloads.\n\
 - Reuse the exact panel id in ExpertPanelEmit.panel_id and ArtifactEmit.metadata.panel.\n\
 - Group artifacts with metadata.group = expert_view, expert_consensus, or expert_summary.\n\
@@ -9591,8 +10312,30 @@ This run is a structured multi-expert workflow.\n\
 - Prefer stable field names and machine-readable values over prose inside JSON."
             .to_string(),
     );
-    if !document_access.files.is_empty() || !web_access.urls.is_empty() || db_access.url.is_some() {
+    if es_access.base_url.is_some()
+        || !document_access.files.is_empty()
+        || !web_access.urls.is_empty()
+        || db_access.url.is_some()
+    {
         let mut access_notes = Vec::new();
+        if es_access.base_url.is_some() {
+            let source_label = es_access
+                .source_name
+                .clone()
+                .or_else(|| es_access.source_id.clone())
+                .unwrap_or_else(|| "connected Elasticsearch source".to_string());
+            let index_label = if !es_access.indices.is_empty() {
+                es_access.indices.join(", ")
+            } else {
+                es_access
+                    .default_index
+                    .clone()
+                    .unwrap_or_else(|| "未设置索引".to_string())
+            };
+            access_notes.push(format!(
+                "- Connected Elasticsearch available via EsSearch: source = {source_label}; preferred index scope = {index_label}"
+            ));
+        }
         if !document_access.files.is_empty() {
             access_notes.push(format!(
                 "- Uploaded documents available via SourceSearch / SourceRead: {}",
@@ -9608,7 +10351,13 @@ This run is a structured multi-expert workflow.\n\
         if !web_access.urls.is_empty() {
             access_notes.push(format!(
                 "- Connected web sources available via SourceWebFetch: {}",
-                web_access.urls.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                web_access
+                    .urls
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if db_access.url.is_some() {
@@ -9626,6 +10375,29 @@ This run is a structured multi-expert workflow.\n\
 {}\n\
 - Prefer these connected sources before falling back to generic file-system exploration.",
             access_notes.join("\n")
+        ));
+    }
+    if request
+        .execution_context
+        .as_ref()
+        .and_then(|context| context.auto_retrieval)
+        .unwrap_or(false)
+        && es_access.base_url.is_some()
+    {
+        let index_label = if !es_access.indices.is_empty() {
+            es_access.indices.join(", ")
+        } else {
+            es_access
+                .default_index
+                .clone()
+                .unwrap_or_else(|| "未设置索引".to_string())
+        };
+        prompt.push(format!(
+            "# Retrieval Priority\n\
+- Auto retrieval is ON for this run.\n\
+- Start with `EsSearch` against the connected Elasticsearch scope ({index_label}) before summarizing.\n\
+- Use concrete query phrases derived from the user's question.\n\
+- Do not use workspace file tools (`read_file`, `grep_search`, `glob_search`) as primary evidence unless Elasticsearch retrieval is empty or the user explicitly asked for code/workspace inspection."
         ));
     }
     if matches!(request.kind, RunKind::Replan) {
@@ -9676,6 +10448,7 @@ struct ServiceApiClient {
     thread: Arc<ManagedThread>,
     run_id: u64,
     abort_signal: HookAbortSignal,
+    expert_stream: Option<ExpertStreamContext>,
     stream_to_thread: bool,
 }
 
@@ -9688,13 +10461,17 @@ impl ServiceApiClient {
         thread: Arc<ManagedThread>,
         run_id: u64,
         abort_signal: HookAbortSignal,
+        expert_stream: Option<ExpertStreamContext>,
         stream_to_thread: bool,
     ) -> Result<Self, String> {
         let base_url = resolve_model_access_value(
             record.model_access.base_url.as_deref(),
             record.model_access.base_url_env.as_deref(),
         )?;
-        let provider_kind = if base_url.is_none() && record.model_access.api_key.is_none() && record.model_access.api_key_env.is_none() {
+        let provider_kind = if base_url.is_none()
+            && record.model_access.api_key.is_none()
+            && record.model_access.api_key_env.is_none()
+        {
             api::detect_provider_kind(&api::resolve_model_alias(&record.model))
         } else {
             provider_kind_for_model_access(&record.model, base_url.as_deref())
@@ -9716,8 +10493,32 @@ impl ServiceApiClient {
             thread,
             run_id,
             abort_signal,
+            expert_stream,
             stream_to_thread,
         })
+    }
+
+    fn publish_stream_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        if self.stream_to_thread {
+            append_draft_text(&self.thread, text);
+            self.thread
+                .publish("assistant_text_delta", json!({ "text": text }));
+            return;
+        }
+
+        if let Some(expert_stream) = &self.expert_stream {
+            publish_expert_text_delta(
+                &self.thread,
+                &expert_stream.run_id,
+                &expert_stream.expert,
+                expert_stream.attempt,
+                text,
+            );
+        }
     }
 
     async fn consume_stream(
@@ -9756,6 +10557,7 @@ impl ServiceApiClient {
                             block,
                             true,
                             self.stream_to_thread,
+                            self.expert_stream.as_ref(),
                         );
                     }
                 }
@@ -9767,16 +10569,13 @@ impl ServiceApiClient {
                         start.content_block,
                         true,
                         self.stream_to_thread,
+                        self.expert_stream.as_ref(),
                     );
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
+                        self.publish_stream_text(&text);
                         if !text.is_empty() {
-                            if self.stream_to_thread {
-                                append_draft_text(&self.thread, &text);
-                                self.thread
-                                    .publish("assistant_text_delta", json!({ "text": text }));
-                            }
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -9836,6 +10635,7 @@ impl ServiceApiClient {
             self.run_id,
             response,
             self.stream_to_thread,
+            self.expert_stream.as_ref(),
         )
     }
 }
@@ -10034,7 +10834,7 @@ fn execute_service_skill(
     .map_err(|error| ToolError::new(error.to_string()))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct EsSearchInput {
     query: String,
     index: Option<String>,
@@ -10065,6 +10865,28 @@ fn es_search_error(
     )
 }
 
+fn publish_expert_text_delta(
+    thread: &Arc<ManagedThread>,
+    run_id: &str,
+    expert: &ExpertPanelExpert,
+    attempt: u8,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    thread.publish(
+        "expert_run_event",
+        json!({
+            "run_id": run_id,
+            "event": "expert_text_delta",
+            "expert": expert.label,
+            "attempt": attempt,
+            "delta": text,
+        }),
+    );
+}
+
 fn execute_es_search(es: &ResolvedEsAccess, value: Value) -> Result<String, ToolError> {
     let input: EsSearchInput = serde_json::from_value(value)
         .map_err(|error| ToolError::new(format!("invalid EsSearch input: {error}")))?;
@@ -10077,16 +10899,18 @@ fn execute_es_search(es: &ResolvedEsAccess, value: Value) -> Result<String, Tool
     let base_url = es.base_url.as_deref().ok_or_else(|| {
         es_search_error("Elasticsearch is not configured", &input, None, None, None)
     })?;
-    let index = input
-        .index
-        .clone()
-        .or_else(|| es.default_index.clone())
-        .ok_or_else(|| es_search_error("missing Elasticsearch index", &input, None, None, None))?;
+    let index = input.index.clone().or_else(|| {
+        if es.indices.is_empty() {
+            es.default_index.clone()
+        } else {
+            Some(es.indices.join(","))
+        }
+    })
+    .ok_or_else(|| es_search_error("missing Elasticsearch index", &input, None, None, None))?;
 
     let url = format!("{}/{}/_search", base_url.trim_end_matches('/'), index);
-    let body = json!({
+    let mut body = json!({
         "size": input.size.unwrap_or(5),
-        "_source": source_fields,
         "query": {
             "simple_query_string": {
                 "query": query,
@@ -10094,33 +10918,56 @@ fn execute_es_search(es: &ResolvedEsAccess, value: Value) -> Result<String, Tool
             }
         }
     });
-
-    let client = reqwest::blocking::Client::new();
-    let mut request = client.post(url).json(&body);
-    if let Some(api_key) = &es.api_key {
-        request = request.bearer_auth(api_key);
-    } else if let (Some(username), Some(password)) = (&es.username, &es.password) {
-        request = request.basic_auth(username, Some(password));
+    if let Some(source_fields) = source_fields {
+        body["_source"] = json!(source_fields);
     }
-    let response = request.send().map_err(|error| {
+
+    let api_key = es.api_key.clone();
+    let username = es.username.clone();
+    let password = es.password.clone();
+    let input_for_request = input.clone();
+    let index_for_request = index.clone();
+    let body_for_request = body.clone();
+    let request_result = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let mut request = client.post(url).json(&body_for_request);
+        if let Some(api_key) = &api_key {
+            request = request.bearer_auth(api_key);
+        } else if let (Some(username), Some(password)) = (&username, &password) {
+            request = request.basic_auth(username, Some(password));
+        }
+        let response = request.send().map_err(|error| {
+            es_search_error(
+                format!("Elasticsearch request failed: {error}"),
+                &input_for_request,
+                Some(&index_for_request),
+                None,
+                None,
+            )
+        })?;
+        let status = response.status();
+        let payload: Value = response.json().map_err(|error| {
+            es_search_error(
+                format!("Elasticsearch response decode failed: {error}"),
+                &input_for_request,
+                Some(&index_for_request),
+                Some(status),
+                None,
+            )
+        })?;
+        Ok::<_, ToolError>((status, payload))
+    })
+    .join()
+    .map_err(|_| {
         es_search_error(
-            format!("Elasticsearch request failed: {error}"),
+            "Elasticsearch worker thread panicked",
             &input,
             Some(&index),
             None,
             None,
         )
     })?;
-    let status = response.status();
-    let payload: Value = response.json().map_err(|error| {
-        es_search_error(
-            format!("Elasticsearch response decode failed: {error}"),
-            &input,
-            Some(&index),
-            Some(status),
-            None,
-        )
-    })?;
+    let (status, payload) = request_result?;
     if !status.is_success() {
         return Err(es_search_error(
             format!("Elasticsearch returned status {status}"),
@@ -10246,10 +11093,7 @@ fn execute_source_search(
     .to_string())
 }
 
-fn execute_source_read(
-    access: &ResolvedDocumentAccess,
-    value: Value,
-) -> Result<String, ToolError> {
+fn execute_source_read(access: &ResolvedDocumentAccess, value: Value) -> Result<String, ToolError> {
     let input: SourceReadInput = serde_json::from_value(value)
         .map_err(|error| ToolError::new(format!("invalid SourceRead input: {error}")))?;
     let file = access.files.iter().find(|item| {
@@ -10727,8 +11571,15 @@ fn execute_expert_panel_emit(
         "query_refs": input.query_refs.unwrap_or_default(),
         "status": input.status.unwrap_or_else(|| "completed".to_string()),
     });
-    append_thread_audit(&state.store, thread, "expert_panel_emit", Some(run_id), payload.clone())
-        .map_err(|error| ToolError::new(format!("persist expert panel record failed: {error}")))?;
+    append_thread_audit(
+        &state.store,
+        thread,
+        "expert_panel_emit",
+        Some(run_id),
+        payload.clone(),
+    )
+    .map_err(|error| ToolError::new(format!("persist expert panel record failed: {error}")))?;
+    let _ = persist_research_task_state(state, thread);
     Ok(json!({
         "stored": true,
         "panel_id": panel_id,
@@ -10777,12 +11628,13 @@ fn normalize_artifact_metadata_for_expert_panel(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            ToolError::new(
-                "ArtifactEmit metadata.group is required during expert panel workflows",
-            )
+            ToolError::new("ArtifactEmit metadata.group is required during expert panel workflows")
         })?
         .to_string();
-    if !matches!(group.as_str(), "expert_view" | "expert_consensus" | "expert_summary") {
+    if !matches!(
+        group.as_str(),
+        "expert_view" | "expert_consensus" | "expert_summary"
+    ) {
         return Err(ToolError::new(format!(
             "ArtifactEmit metadata.group must be one of expert_view, expert_consensus, expert_summary during expert panel workflows; got `{group}`"
         )));
@@ -10799,7 +11651,10 @@ fn normalize_artifact_metadata_for_expert_panel(
                     "ArtifactEmit metadata.expert_name is required when metadata.group = expert_view",
                 )
             })?;
-        let known = panel.experts.iter().any(|expert| expert.label == expert_name);
+        let known = panel
+            .experts
+            .iter()
+            .any(|expert| expert.label == expert_name);
         if !known {
             return Err(ToolError::new(format!(
                 "ArtifactEmit metadata.expert_name does not match the current expert panel: `{expert_name}`"
@@ -10818,9 +11673,8 @@ fn normalize_artifact_metadata_for_expert_panel(
     }
 
     metadata.insert("panel".to_string(), Value::String(panel.panel_id.clone()));
-    let canonical_stage = canonical_expert_panel_stage(
-        metadata.get("stage").and_then(Value::as_str),
-    );
+    let canonical_stage =
+        canonical_expert_panel_stage(metadata.get("stage").and_then(Value::as_str));
     if let Some(stage) = canonical_stage {
         metadata.insert("stage".to_string(), Value::String(stage));
     } else if matches!(group.as_str(), "expert_summary" | "expert_consensus") {
@@ -10829,9 +11683,14 @@ fn normalize_artifact_metadata_for_expert_panel(
         } else {
             "phase_3"
         };
-        metadata.insert("stage".to_string(), Value::String(default_stage.to_string()));
+        metadata.insert(
+            "stage".to_string(),
+            Value::String(default_stage.to_string()),
+        );
     } else {
-        metadata.entry("stage".to_string()).or_insert_with(|| Value::String("phase_1".to_string()));
+        metadata
+            .entry("stage".to_string())
+            .or_insert_with(|| Value::String("phase_1".to_string()));
     }
     Ok(Some(Value::Object(metadata)))
 }
@@ -10879,6 +11738,7 @@ fn store_thread_artifact(
             "metadata": artifact.metadata.clone(),
         }),
     );
+    let _ = persist_research_task_state(state, thread);
     thread.publish("artifact_added", json!(artifact.clone()));
     thread.publish("status_changed", json!(snapshot));
     Ok(artifact)
@@ -10995,17 +11855,17 @@ fn web_fetch_artifact_title(url: &str) -> String {
     "网页摘录".to_string()
 }
 
-fn append_tool_result_artifact_reference(
-    output: &str,
-    artifact: &ArtifactRecord,
-) -> String {
+fn append_tool_result_artifact_reference(output: &str, artifact: &ArtifactRecord) -> String {
     let Ok(mut parsed) = serde_json::from_str::<Value>(output) else {
         return output.to_string();
     };
     let Some(object) = parsed.as_object_mut() else {
         return output.to_string();
     };
-    object.insert("artifact_id".to_string(), Value::String(artifact.id.clone()));
+    object.insert(
+        "artifact_id".to_string(),
+        Value::String(artifact.id.clone()),
+    );
     if let Some(title) = artifact.title.as_ref() {
         object.insert("artifact_title".to_string(), Value::String(title.clone()));
     }
@@ -11221,7 +12081,8 @@ fn allowed_tool_names(
 ) -> BTreeSet<String> {
     let has_explicit_project = record.project_id.is_some();
     let managed_root = config.managed_workspaces_dir();
-    let has_explicit_workspace = has_explicit_project || !record.workspace_root.starts_with(&managed_root);
+    let has_explicit_workspace =
+        has_explicit_project || !record.workspace_root.starts_with(&managed_root);
     let has_es_access = has_explicit_project && es_access.base_url.is_some();
     let has_document_access = has_explicit_project && !document_access.files.is_empty();
     let has_web_access = has_explicit_project && !web_access.urls.is_empty();
@@ -11246,8 +12107,7 @@ fn allowed_tool_names(
                             | "TopicDriftCheck"
                             | "ArtifactEmit"
                             | "ExpertPanelEmit"
-                    )
-                        || (name == "EsSearch" && has_es_access)
+                    ) || (name == "EsSearch" && has_es_access)
                         || (name == "SourceSearch" && has_document_access)
                         || (name == "SourceRead" && has_document_access)
                         || (name == "SourceWebFetch" && has_web_access)
@@ -11255,6 +12115,18 @@ fn allowed_tool_names(
                 }),
         )
         .collect()
+}
+
+fn restrict_expert_file_tools_for_es(
+    allowed_tools: &mut BTreeSet<String>,
+    es_access: &ResolvedEsAccess,
+) {
+    if es_access.base_url.is_none() {
+        return;
+    }
+    for tool_name in SAFE_BUILTIN_TOOLS {
+        allowed_tools.remove(*tool_name);
+    }
 }
 
 fn rewrite_tool_input(
@@ -11337,7 +12209,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
                     ContentBlock::Thinking { .. } => None,
                     ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
@@ -11374,6 +12248,7 @@ fn push_output_block(
     block: OutputContentBlock,
     streaming_tool_input: bool,
     stream_to_thread: bool,
+    expert_stream: Option<&ExpertStreamContext>,
 ) {
     match block {
         OutputContentBlock::Text { text } => {
@@ -11381,6 +12256,14 @@ fn push_output_block(
                 if stream_to_thread {
                     append_draft_text(thread, &text);
                     thread.publish("assistant_text_delta", json!({ "text": text }));
+                } else if let Some(expert_stream) = expert_stream {
+                    publish_expert_text_delta(
+                        thread,
+                        &expert_stream.run_id,
+                        &expert_stream.expert,
+                        expert_stream.attempt,
+                        &text,
+                    );
                 }
                 events.push(AssistantEvent::TextDelta(text));
             }
@@ -11407,6 +12290,7 @@ fn response_to_events(
     run_id: u64,
     response: MessageResponse,
     stream_to_thread: bool,
+    expert_stream: Option<&ExpertStreamContext>,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
@@ -11418,6 +12302,7 @@ fn response_to_events(
             block,
             false,
             stream_to_thread,
+            expert_stream,
         );
         if let Some((id, name, input)) = pending_tool.take() {
             thread.publish(
@@ -11529,8 +12414,8 @@ fn snapshot_from_state(state: &ThreadState) -> ThreadSnapshot {
 }
 
 fn project_summary_from_record(record: ProjectRecord) -> ProjectSummary {
-    let model_api_key_configured = record.model_access.api_key.is_some()
-        || record.model_access.api_key_env.is_some();
+    let model_api_key_configured =
+        record.model_access.api_key.is_some() || record.model_access.api_key_env.is_some();
     ProjectSummary {
         id: record.id,
         name: record.name,
@@ -11548,34 +12433,6 @@ fn project_summary_from_record(record: ProjectRecord) -> ProjectSummary {
         default_skill_names: record.default_skill_names,
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
-    }
-}
-
-fn knowledge_base_matches_user_scope(
-    record: &KnowledgeBaseRecord,
-    tenant_id: Option<&str>,
-    user_id: &str,
-) -> bool {
-    if record.tenant_id.as_deref() != tenant_id {
-        return false;
-    }
-    match record.owner_id.as_deref() {
-        Some(owner_id) => owner_id == user_id,
-        None => true,
-    }
-}
-
-fn data_source_matches_user_scope(
-    record: &DataSourceRecord,
-    tenant_id: Option<&str>,
-    user_id: &str,
-) -> bool {
-    if record.tenant_id.as_deref() != tenant_id {
-        return false;
-    }
-    match record.owner_id.as_deref() {
-        Some(owner_id) => owner_id == user_id,
-        None => true,
     }
 }
 
@@ -11709,8 +12566,9 @@ fn data_source_summary_core(
         DataSourceKind::Db => string_config_value(config, "database")
             .or_else(|| string_config_value(config, "schema"))
             .or_else(|| string_config_value(config, "url")),
-        DataSourceKind::LocalDir => string_config_value(config, "path")
-            .map(|path| present_path_tail(&path)),
+        DataSourceKind::LocalDir => {
+            string_config_value(config, "path").map(|path| present_path_tail(&path))
+        }
         _ => None,
     };
     DataSourceSummary {
@@ -11787,11 +12645,17 @@ fn build_data_source_test_result(
 
 fn test_es_data_source(config: &Value) -> Result<DataSourceTestResult, AppError> {
     let access = ResolvedEsAccess {
-        base_url: string_config_value(config, "endpoint").or_else(|| string_config_value(config, "base_url")),
+        base_url: string_config_value(config, "endpoint")
+            .or_else(|| string_config_value(config, "base_url")),
         api_key: string_config_value(config, "api_key"),
         username: string_config_value(config, "username"),
         password: string_config_value(config, "password"),
-        default_index: string_config_value(config, "index").or_else(|| string_config_value(config, "default_index")),
+        default_index: string_config_value(config, "index")
+            .or_else(|| string_config_value(config, "default_index")),
+        indices: string_config_value(config, "index")
+            .or_else(|| string_config_value(config, "default_index"))
+            .into_iter()
+            .collect::<Vec<_>>(),
         source_id: None,
         source_name: None,
     };
@@ -11803,8 +12667,12 @@ fn test_es_data_source(config: &Value) -> Result<DataSourceTestResult, AppError>
         }),
     )
     .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let parsed: Value = serde_json::from_str(&output)
-        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, format!("es test decode failed: {error}")))?;
+    let parsed: Value = serde_json::from_str(&output).map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("es test decode failed: {error}"),
+        )
+    })?;
     let total = parsed.get("total").and_then(Value::as_u64).unwrap_or(0);
     let endpoint = access.base_url.unwrap_or_else(|| "未设置".to_string());
     let index = access.default_index.unwrap_or_else(|| "未设置".to_string());
@@ -11818,7 +12686,10 @@ fn test_es_data_source(config: &Value) -> Result<DataSourceTestResult, AppError>
     Ok(DataSourceTestResult {
         kind: DataSourceKind::Es,
         status: "ready".to_string(),
-        summary: format!("Elasticsearch 连接可用，索引可访问，当前测试命中 {} 条。", total),
+        summary: format!(
+            "Elasticsearch 连接可用，索引可访问，当前测试命中 {} 条。",
+            total
+        ),
         checked_at_ms: now_millis(),
         details: vec![
             DataSourceTestDetail {
@@ -11859,8 +12730,12 @@ fn test_db_data_source(config: &Value) -> Result<DataSourceTestResult, AppError>
         }),
     )
     .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let parsed: Value = serde_json::from_str(&output)
-        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, format!("db test decode failed: {error}")))?;
+    let parsed: Value = serde_json::from_str(&output).map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("db test decode failed: {error}"),
+        )
+    })?;
     let row_count = parsed.get("row_count").and_then(Value::as_u64).unwrap_or(0);
     let url = access.url.unwrap_or_else(|| "未设置".to_string());
     let engine = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
@@ -11874,7 +12749,10 @@ fn test_db_data_source(config: &Value) -> Result<DataSourceTestResult, AppError>
     Ok(DataSourceTestResult {
         kind: DataSourceKind::Db,
         status: "ready".to_string(),
-        summary: format!("数据库连接可用，只读查询已通过，测试返回 {} 行。", row_count),
+        summary: format!(
+            "数据库连接可用，只读查询已通过，测试返回 {} 行。",
+            row_count
+        ),
         checked_at_ms: now_millis(),
         details: vec![
             DataSourceTestDetail {
@@ -11899,10 +12777,12 @@ fn test_db_data_source(config: &Value) -> Result<DataSourceTestResult, AppError>
 
 fn test_web_data_source(config: &Value) -> Result<DataSourceTestResult, AppError> {
     let urls = string_array_config_value(config, "urls");
-    let first = urls
-        .first()
-        .cloned()
-        .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "web data source requires at least one url"))?;
+    let first = urls.first().cloned().ok_or_else(|| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            "web data source requires at least one url",
+        )
+    })?;
     let configured_url_count = urls.len();
     let access = ResolvedWebAccess {
         source_id: None,
@@ -11917,8 +12797,12 @@ fn test_web_data_source(config: &Value) -> Result<DataSourceTestResult, AppError
         }),
     )
     .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let parsed: Value = serde_json::from_str(&output)
-        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, format!("web test decode failed: {error}")))?;
+    let parsed: Value = serde_json::from_str(&output).map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("web test decode failed: {error}"),
+        )
+    })?;
     let url = parsed.get("url").and_then(Value::as_str).unwrap_or("网页");
     let content_type = parsed
         .get("content_type")
@@ -11968,7 +12852,10 @@ fn extract_text_preview(text: &str, query: &str, max_chars: usize) -> String {
     let query_lower = query.to_lowercase();
     let text_lower = normalized_text.to_lowercase();
     if let Some(position) = text_lower.find(&query_lower) {
-        let start = normalized_text[..position].chars().count().saturating_sub(max_chars / 3);
+        let start = normalized_text[..position]
+            .chars()
+            .count()
+            .saturating_sub(max_chars / 3);
         let snippet = normalized_text
             .chars()
             .skip(start)
@@ -11994,10 +12881,7 @@ fn html_to_text_if_needed(content_type: &str, body: &str) -> String {
                 _ => {}
             }
         }
-        return text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        return text.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     body.to_string()
 }
@@ -12107,15 +12991,17 @@ fn execute_postgres_query(
             .into_iter()
             .map(postgres_row_to_json)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok::<_, ToolError>(json!({
-            "data_source_id": access.source_id,
-            "data_source_name": access.source_name,
-            "query": input.sql,
-            "columns": columns,
-            "rows": items,
-            "row_count": items.len(),
-        })
-        .to_string())
+        Ok::<_, ToolError>(
+            json!({
+                "data_source_id": access.source_id,
+                "data_source_name": access.source_name,
+                "query": input.sql,
+                "columns": columns,
+                "rows": items,
+                "row_count": items.len(),
+            })
+            .to_string(),
+        )
     })
 }
 
@@ -12141,7 +13027,20 @@ fn postgres_row_to_json(row: tokio_postgres::Row) -> Result<Value, ToolError> {
 fn resolve_thread_data_access(
     store: &ThreadStore,
     record: &ThreadRecord,
+    execution_context: Option<&RunExecutionContext>,
 ) -> Result<ResolvedDataAccess, Box<dyn std::error::Error>> {
+    if let Some(source_ids) = execution_context
+        .and_then(|context| context.data_source_ids.as_ref())
+        .filter(|items| !items.is_empty())
+    {
+        let data_sources = store
+            .load_data_sources()?
+            .into_iter()
+            .filter(|item| source_ids.iter().any(|source_id| source_id == &item.id))
+            .collect::<Vec<_>>();
+        return Ok(ResolvedDataAccess { data_sources });
+    }
+
     let knowledge_base = if let Some(knowledge_base_id) = record.knowledge_base_id.as_deref() {
         store.get_knowledge_base(knowledge_base_id)?
     } else if let Some(project_id) = record.project_id.as_deref() {
@@ -12163,9 +13062,7 @@ fn resolve_thread_data_access(
         .into_iter()
         .filter(|item| item.knowledge_base_id == knowledge_base.id)
         .collect::<Vec<_>>();
-    Ok(ResolvedDataAccess {
-        data_sources,
-    })
+    Ok(ResolvedDataAccess { data_sources })
 }
 
 fn resolve_override_knowledge_base_for_run(
@@ -12173,8 +13070,8 @@ fn resolve_override_knowledge_base_for_run(
     record: &ThreadRecord,
     execution_context: Option<&RunExecutionContext>,
 ) -> Result<Option<KnowledgeBaseRecord>, AppError> {
-    let Some(knowledge_base_id) = execution_context
-        .and_then(|context| context.knowledge_base_id.as_deref())
+    let Some(knowledge_base_id) =
+        execution_context.and_then(|context| context.knowledge_base_id.as_deref())
     else {
         return Ok(None);
     };
@@ -12183,11 +13080,20 @@ fn resolve_override_knowledge_base_for_run(
         .get_knowledge_base(knowledge_base_id)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "knowledge base not found"))?;
-    if !knowledge_base_matches_user_scope(
+    let can_access = knowledge_base_matches_platform_scope(
         &knowledge_base,
         record.tenant_id.as_deref(),
-        record.owner_id.as_deref().unwrap_or_default(),
-    ) {
+    ) || record
+        .owner_id
+        .as_deref()
+        .is_some_and(|owner_id| {
+            knowledge_base_matches_user_scope(
+                &knowledge_base,
+                record.tenant_id.as_deref(),
+                owner_id,
+            )
+        });
+    if !can_access {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
             "knowledge base not found",
@@ -12216,6 +13122,7 @@ fn resolve_run_execution_context(
 
     Ok(Some(RunExecutionContext {
         knowledge_base_id: context.knowledge_base_id.clone(),
+        data_source_ids: context.data_source_ids.clone(),
         knowledge_base_name,
         auto_retrieval: context.auto_retrieval,
     }))
@@ -12319,17 +13226,26 @@ fn present_path_tail(value: &str) -> String {
 }
 
 fn resolve_es_access(config: &EsConfig, data_access: &ResolvedDataAccess) -> ResolvedEsAccess {
-    let source_override = data_access
+    let es_sources = data_access
         .data_sources
         .iter()
-        .find(|source| source.kind == DataSourceKind::Es);
+        .filter(|source| source.kind == DataSourceKind::Es)
+        .collect::<Vec<_>>();
+    let indices = es_sources
+        .iter()
+        .filter_map(|source| {
+            string_config_value(&source.config, "index")
+                .or_else(|| string_config_value(&source.config, "default_index"))
+        })
+        .collect::<Vec<_>>();
 
-    if let Some(source) = source_override {
+    if let Some(source) = es_sources.first() {
         return ResolvedEsAccess {
             base_url: string_config_value(&source.config, "endpoint")
                 .or_else(|| string_config_value(&source.config, "base_url"))
                 .or_else(|| config.base_url.clone()),
-            api_key: string_config_value(&source.config, "api_key").or_else(|| config.api_key.clone()),
+            api_key: string_config_value(&source.config, "api_key")
+                .or_else(|| config.api_key.clone()),
             username: string_config_value(&source.config, "username")
                 .or_else(|| config.username.clone()),
             password: string_config_value(&source.config, "password")
@@ -12337,6 +13253,7 @@ fn resolve_es_access(config: &EsConfig, data_access: &ResolvedDataAccess) -> Res
             default_index: string_config_value(&source.config, "index")
                 .or_else(|| string_config_value(&source.config, "default_index"))
                 .or_else(|| config.default_index.clone()),
+            indices,
             source_id: Some(source.id.clone()),
             source_name: Some(source.name.clone()),
         };
@@ -12348,6 +13265,11 @@ fn resolve_es_access(config: &EsConfig, data_access: &ResolvedDataAccess) -> Res
         username: config.username.clone(),
         password: config.password.clone(),
         default_index: config.default_index.clone(),
+        indices: config
+            .default_index
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
         source_id: None,
         source_name: None,
     }
@@ -12411,7 +13333,10 @@ fn thread_message_id(thread_id: &str, index: usize) -> String {
     format!("{thread_id}-message-{index}")
 }
 
-fn resolve_source_message_text(thread: &Arc<ManagedThread>, source_message_id: &str) -> Option<String> {
+fn resolve_source_message_text(
+    thread: &Arc<ManagedThread>,
+    source_message_id: &str,
+) -> Option<String> {
     let guard = thread
         .shared
         .lock()
@@ -12434,7 +13359,11 @@ fn resolve_source_message_text(thread: &Arc<ManagedThread>, source_message_id: &
     (!text.is_empty()).then_some(text)
 }
 
-fn message_snapshot(thread_id: &str, index: usize, message: &ConversationMessage) -> MessageSnapshot {
+fn message_snapshot(
+    thread_id: &str,
+    index: usize,
+    message: &ConversationMessage,
+) -> MessageSnapshot {
     MessageSnapshot {
         id: thread_message_id(thread_id, index),
         role: match message.role {
@@ -12448,7 +13377,9 @@ fn message_snapshot(thread_id: &str, index: usize, message: &ConversationMessage
             .blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(MessageBlockSnapshot::Text { text: text.clone() }),
+                ContentBlock::Text { text } => {
+                    Some(MessageBlockSnapshot::Text { text: text.clone() })
+                }
                 ContentBlock::Thinking { .. } => None,
                 ContentBlock::ToolUse { id, name, input } => Some(MessageBlockSnapshot::ToolUse {
                     id: id.clone(),
@@ -12573,9 +13504,7 @@ Reassess scope, identify the missing evidence, and continue with a tighter plan.
     )
 }
 
-fn normalize_expert_panel_request(
-    input: ExpertPanelRequest,
-) -> Result<ExpertPanelRequest, String> {
+fn normalize_expert_panel_request(input: ExpertPanelRequest) -> Result<ExpertPanelRequest, String> {
     let panel_id = input.panel_id.trim();
     if panel_id.is_empty() {
         return Err("expert panel id must not be empty".to_string());
@@ -12617,6 +13546,16 @@ fn normalize_expert_panel_run_request(
     let question = normalize_optional_text(input.question);
     let source_message_id = normalize_optional_text(input.source_message_id);
     let knowledge_base_id = normalize_optional_text(input.knowledge_base_id);
+    let data_source_ids = input
+        .data_source_ids
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty());
     let auto_retrieval = input.auto_retrieval;
     if question.is_some() == source_message_id.is_some() {
         return Err(
@@ -12637,6 +13576,7 @@ fn normalize_expert_panel_run_request(
         question,
         source_message_id,
         knowledge_base_id,
+        data_source_ids,
         auto_retrieval,
         experts: panel.experts,
         retry_count: Some(retry_count),
@@ -12722,16 +13662,21 @@ fn expert_run_response_supersedes(
     if candidate_rank != existing_rank {
         return candidate_rank > existing_rank;
     }
-    for (existing_expert, candidate_expert) in existing.experts.iter().zip(candidate.experts.iter()) {
+    for (existing_expert, candidate_expert) in existing.experts.iter().zip(candidate.experts.iter())
+    {
         let existing_expert_rank = expert_run_status_rank(match existing_expert.status {
             ExpertPanelExpertStatus::Queued => ExpertPanelRunStatus::Queued,
-            ExpertPanelExpertStatus::Running | ExpertPanelExpertStatus::Retrying => ExpertPanelRunStatus::Running,
+            ExpertPanelExpertStatus::Running | ExpertPanelExpertStatus::Retrying => {
+                ExpertPanelRunStatus::Running
+            }
             ExpertPanelExpertStatus::Succeeded => ExpertPanelRunStatus::Succeeded,
             ExpertPanelExpertStatus::Failed => ExpertPanelRunStatus::Failed,
         });
         let candidate_expert_rank = expert_run_status_rank(match candidate_expert.status {
             ExpertPanelExpertStatus::Queued => ExpertPanelRunStatus::Queued,
-            ExpertPanelExpertStatus::Running | ExpertPanelExpertStatus::Retrying => ExpertPanelRunStatus::Running,
+            ExpertPanelExpertStatus::Running | ExpertPanelExpertStatus::Retrying => {
+                ExpertPanelRunStatus::Running
+            }
             ExpertPanelExpertStatus::Succeeded => ExpertPanelRunStatus::Succeeded,
             ExpertPanelExpertStatus::Failed => ExpertPanelRunStatus::Failed,
         });
@@ -12741,8 +13686,10 @@ fn expert_run_response_supersedes(
         if candidate_expert.attempts != existing_expert.attempts {
             return candidate_expert.attempts > existing_expert.attempts;
         }
-        let existing_has_detail = existing_expert.content.is_some() || existing_expert.error.is_some();
-        let candidate_has_detail = candidate_expert.content.is_some() || candidate_expert.error.is_some();
+        let existing_has_detail =
+            existing_expert.content.is_some() || existing_expert.error.is_some();
+        let candidate_has_detail =
+            candidate_expert.content.is_some() || candidate_expert.error.is_some();
         if existing_has_detail != candidate_has_detail {
             return candidate_has_detail;
         }
@@ -12809,6 +13756,254 @@ fn persist_expert_run_state(
             "status": response.status,
         }),
     );
+    Ok(())
+}
+
+fn text_from_message(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn contains_retrieval_tool(message: &ConversationMessage) -> bool {
+    message.blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse { name, .. } if name == "EsSearch" || name == "SourceSearch"
+        )
+    })
+}
+
+fn is_expert_message_text(text: &str) -> bool {
+    if !text.starts_with("### ") {
+        return false;
+    }
+    !text.to_ascii_lowercase().contains("### final synthesis")
+}
+
+fn is_explicit_write_intent_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    [
+        "用这些证据重写",
+        "基于这些证据重写",
+        "用证据重写",
+        "根据证据重写",
+        "整理为报告",
+        "生成正式报告",
+        "生成报告",
+        "输出报告",
+        "撰写报告",
+    ]
+    .iter()
+    .any(|pattern| trimmed.contains(pattern))
+}
+
+fn audit_prompt(record: &AuditRecord) -> Option<&str> {
+    if record.kind != "run_started" {
+        return None;
+    }
+    record.payload.get("prompt").and_then(Value::as_str)
+}
+
+fn infer_research_task_state(thread: &Arc<ManagedThread>) -> Option<ResearchTaskStateRecord> {
+    let guard = thread
+        .shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let title = guard
+        .record
+        .topic
+        .clone()
+        .unwrap_or_else(|| "未命名研究".to_string());
+
+    let mut question_count = 0_usize;
+    let mut retrieval_count = 0_usize;
+    let mut expert_count = 0_usize;
+    let mut synthesis_count = 0_usize;
+    let mut write_intent_count = 0_usize;
+    let artifact_count = guard.record.artifacts.len();
+
+    for message in &guard.session.messages {
+        let text = text_from_message(message);
+        match message.role {
+            MessageRole::User if !text.is_empty() => {
+                question_count += 1;
+            }
+            MessageRole::Assistant if text.to_ascii_lowercase().contains("### final synthesis") => {
+                synthesis_count += 1;
+            }
+            MessageRole::Assistant if is_expert_message_text(&text) => {
+                expert_count += 1;
+            }
+            _ => {}
+        }
+        if contains_retrieval_tool(message) {
+            retrieval_count += 1;
+        }
+    }
+
+    for audit in &guard.audit_records {
+        if audit_prompt(audit).is_some_and(is_explicit_write_intent_text) {
+            write_intent_count += 1;
+        }
+    }
+
+    if question_count == 0
+        && retrieval_count == 0
+        && expert_count == 0
+        && synthesis_count == 0
+        && write_intent_count == 0
+        && artifact_count == 0
+    {
+        return None;
+    }
+
+    let status = if write_intent_count > 0 && synthesis_count > 0 {
+        ResearchTaskStage::WritingReady
+    } else if synthesis_count > 0 {
+        ResearchTaskStage::Synthesis
+    } else if expert_count > 0 {
+        ResearchTaskStage::ExpertReview
+    } else if retrieval_count > 0 {
+        ResearchTaskStage::Retrieval
+    } else {
+        ResearchTaskStage::Question
+    };
+
+    let mut stage_history = Vec::new();
+    stage_history.push(ResearchTaskStageRecord {
+        stage: ResearchTaskStage::Question,
+        label: ResearchTaskStage::Question.label().to_string(),
+        at_ms: guard.record.created_at_ms,
+    });
+    if retrieval_count > 0 {
+        stage_history.push(ResearchTaskStageRecord {
+            stage: ResearchTaskStage::Retrieval,
+            label: ResearchTaskStage::Retrieval.label().to_string(),
+            at_ms: guard.record.updated_at_ms,
+        });
+    }
+    if expert_count > 0 {
+        stage_history.push(ResearchTaskStageRecord {
+            stage: ResearchTaskStage::ExpertReview,
+            label: ResearchTaskStage::ExpertReview.label().to_string(),
+            at_ms: guard.record.updated_at_ms,
+        });
+    }
+    if synthesis_count > 0 {
+        stage_history.push(ResearchTaskStageRecord {
+            stage: ResearchTaskStage::Synthesis,
+            label: ResearchTaskStage::Synthesis.label().to_string(),
+            at_ms: guard.record.updated_at_ms,
+        });
+    }
+    if write_intent_count > 0 && synthesis_count > 0 {
+        stage_history.push(ResearchTaskStageRecord {
+            stage: ResearchTaskStage::WritingReady,
+            label: ResearchTaskStage::WritingReady.label().to_string(),
+            at_ms: guard.record.updated_at_ms,
+        });
+    }
+
+    let (next_recommended_action, available_actions) = match status {
+        ResearchTaskStage::WritingReady => (
+            "整理综合结论并生成正式报告".to_string(),
+            vec![
+                "用这些证据重写".to_string(),
+                "整理为报告".to_string(),
+                "补充反方观点".to_string(),
+            ],
+        ),
+        ResearchTaskStage::Synthesis => (
+            "补充证据或直接整理为报告".to_string(),
+            vec![
+                "整理为报告".to_string(),
+                "补充证据".to_string(),
+                "用这些证据重写".to_string(),
+            ],
+        ),
+        ResearchTaskStage::ExpertReview => (
+            "要求专家交叉复评或补充证据".to_string(),
+            vec![
+                "先查资料".to_string(),
+                "补充反方观点".to_string(),
+                "只讨论不写作".to_string(),
+            ],
+        ),
+        ResearchTaskStage::Retrieval => (
+            "基于证据回答或发起专家复评".to_string(),
+            vec![
+                "发起专家复评".to_string(),
+                "继续检索".to_string(),
+                "基于证据回答".to_string(),
+            ],
+        ),
+        ResearchTaskStage::Question => (
+            "继续澄清问题或指定资料范围".to_string(),
+            vec![
+                "先查资料".to_string(),
+                "发起专家会诊".to_string(),
+                "继续提问".to_string(),
+            ],
+        ),
+    };
+
+    Some(ResearchTaskStateRecord {
+        id: guard.record.id.clone(),
+        title,
+        status: status.clone(),
+        status_label: status.label().to_string(),
+        next_recommended_action,
+        available_actions,
+        stage_history,
+    })
+}
+
+fn latest_research_task_state_from_audit(
+    thread: &Arc<ManagedThread>,
+) -> Option<ResearchTaskStateRecord> {
+    let guard = thread
+        .shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .audit_records
+        .iter()
+        .rev()
+        .find(|record| record.kind == "research_task_state")
+        .and_then(|record| {
+            serde_json::from_value::<ResearchTaskStateRecord>(record.payload.clone()).ok()
+        })
+}
+
+fn persist_research_task_state(
+    state: &Arc<AppState>,
+    thread: &Arc<ManagedThread>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(next_state) = infer_research_task_state(thread) else {
+        return Ok(());
+    };
+    if latest_research_task_state_from_audit(thread).as_ref() == Some(&next_state) {
+        return Ok(());
+    }
+    append_thread_audit(
+        &state.store,
+        thread,
+        "research_task_state",
+        None,
+        serde_json::to_value(next_state)?,
+    )?;
     Ok(())
 }
 
@@ -13201,9 +14396,9 @@ fn normalize_terms(text: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::fs;
     use std::ffi::OsString;
+    use std::fs;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -13218,30 +14413,35 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        allowed_tool_names, apply_project_update, build_system_prompt, build_tool_registry, collect_capacity_usage, default_database_url,
+        allowed_tool_names, append_thread_audit, apply_project_update, build_system_prompt,
+        build_tool_registry, collect_capacity_usage, default_database_url,
         delete_service_skill_file, discover_allowed_roots, ensure_mutation_rate_limit,
-        ensure_run_capacity, ensure_thread_capacity, import_legacy_thread_records,
-        list_service_skills, load_threads, mutation_user_scope_key,
-        normalize_expert_panel_run_request, normalize_project_default_skill_names, normalize_terms, parse_bootstrap_api_keys,
-        parse_limit_env, parse_run_timeout_secs, parse_skill_starter_prompt_from_contents,
-        parse_skill_tags_from_contents, parse_user_id, persist_thread_state, render_skill_prompt,
-        resolve_es_access, resolve_service_skill, rewrite_tool_input, sqlite_path_from_url, thread_is_visible_to_auth,
-        provider_client_from_record, provider_kind_for_model_access, request_model_for_model_access,
-        ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord, AuditRecord, AuthContext, AuthMode,
-        CapacityUsage, CommandRequest, DataSourceKind, DataSourceRecord, EsConfig,
-        ExpertPanelRunExpertState, ExpertPanelRunRequest, ExpertPanelRunResponse, ExpertPanelRunStatus,
-        KnowledgeBaseRecord, ManagedThread, MemoryNote, MemoryScope, MemorySearchScope,
-        MessageBlockSnapshot, ModelAccessConfig, MutationRateLimiter, MutationRateUsage,
-        ProjectRecord, ProviderKind, ResolvedDataAccess, ResolvedDbAccess,
-        ResolvedDocumentAccess, ResolvedWebAccess, RunKind, RunRequest, SkillScope,
-        ThreadRecord, ThreadState, ThreadStatus, ThreadStore, UpdateProjectRequest,
-        CURRENT_DATABASE_SCHEMA_VERSION, MAX_VISIBLE_AUDIT_RECORDS, append_thread_audit,
-        expert_run_response_from_audit, get_expert_panel_run, persist_expert_run_state,
-        post_thread_command, ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest,
-        execute_artifact_emit, execute_expert_panel_emit,
+        ensure_run_capacity, ensure_thread_capacity, execute_artifact_emit,
+        execute_expert_panel_emit, expert_run_response_from_audit, get_expert_panel_run,
+        import_legacy_thread_records, list_service_skills, load_threads, mutation_user_scope_key,
+        normalize_expert_panel_run_request, normalize_project_default_skill_names, normalize_terms,
+        parse_bootstrap_api_keys, parse_limit_env, parse_run_timeout_secs,
+        parse_skill_starter_prompt_from_contents, parse_skill_tags_from_contents, parse_user_id,
+        persist_expert_run_state, persist_research_task_state, persist_thread_state,
+        post_thread_command, provider_client_from_record, provider_kind_for_model_access,
+        render_skill_prompt, request_model_for_model_access, resolve_es_access,
+        resolve_service_skill, rewrite_tool_input, sqlite_path_from_url, thread_is_visible_to_auth,
+        ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord, AuditRecord, AuthContext,
+        AuthMode, CapacityUsage, CommandRequest, DataSourceKind, DataSourceRecord, EsConfig,
+        ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest, ExpertPanelRunExpertState,
+        ExpertPanelRunRequest, ExpertPanelRunResponse, ExpertPanelRunStatus, KnowledgeBaseRecord,
+        ManagedThread, MemoryNote, MemoryScope, MemorySearchScope, MessageBlockSnapshot,
+        ModelAccessConfig, MutationRateLimiter, MutationRateUsage, ProjectRecord, ProviderKind,
+        ResearchTaskStage, ResearchTaskStateRecord, ResolvedDataAccess, ResolvedDbAccess,
+        ResolvedDocumentAccess, ResolvedWebAccess, RunKind, RunRequest, SkillScope, ThreadRecord,
+        ThreadState, ThreadStatus, ThreadStore, UpdateProjectRequest,
+        CURRENT_DATABASE_SCHEMA_VERSION, MAX_VISIBLE_AUDIT_RECORDS,
     };
-    use api::InputContentBlock;
+    use crate::agent_turns::{
+        AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
+    };
     use crate::{create_expert_panel_run, create_thread, AuthQuery, CreateThreadRequest};
+    use api::InputContentBlock;
 
     fn test_thread(owner_id: Option<&str>) -> ManagedThread {
         ManagedThread::new(ThreadState {
@@ -13341,6 +14541,7 @@ mod tests {
             max_mutation_requests_per_minute_per_tenant: Some(120),
             max_mutation_requests_per_minute_per_user: Some(30),
             dev_user_header_auth_enabled: true,
+            platform_admin_users: std::collections::BTreeSet::new(),
             bootstrap_api_keys: Vec::new(),
             allowed_roots: vec![data_dir],
             es: EsConfig::default(),
@@ -13385,7 +14586,8 @@ mod tests {
                         panic!("unexpected eof");
                     }
                     buffer.extend_from_slice(&chunk[..read]);
-                    if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                    if let Some(position) =
+                        buffer.windows(4).position(|window| window == b"\r\n\r\n")
                     {
                         break position + 4;
                     }
@@ -13641,7 +14843,10 @@ mod tests {
     #[test]
     fn model_access_base_url_can_select_openai_compat_transport() {
         assert_eq!(
-            provider_kind_for_model_access("claude-sonnet-4-6", Some("https://models.example.test/v1")),
+            provider_kind_for_model_access(
+                "claude-sonnet-4-6",
+                Some("https://models.example.test/v1")
+            ),
             ProviderKind::OpenAi
         );
         assert_eq!(
@@ -13649,7 +14854,10 @@ mod tests {
             ProviderKind::Anthropic
         );
         assert_eq!(
-            provider_kind_for_model_access("openai/gpt-5.4", Some("https://models.example.test/v1")),
+            provider_kind_for_model_access(
+                "openai/gpt-5.4",
+                Some("https://models.example.test/v1")
+            ),
             ProviderKind::OpenAi
         );
         assert_eq!(
@@ -13701,9 +14909,12 @@ mod tests {
         let registry = build_tool_registry().expect("tool registry");
 
         let record = test_record(&temp_dir, Some("alice"));
-        let es_access = resolve_es_access(&config.es, &ResolvedDataAccess {
-            data_sources: Vec::new(),
-        });
+        let es_access = resolve_es_access(
+            &config.es,
+            &ResolvedDataAccess {
+                data_sources: Vec::new(),
+            },
+        );
         let allowed = allowed_tool_names(
             &config,
             &registry,
@@ -13729,9 +14940,12 @@ mod tests {
 
         let mut record = test_record(&temp_dir, Some("alice"));
         record.project_id = Some("project-1".to_string());
-        let es_access = resolve_es_access(&config.es, &ResolvedDataAccess {
-            data_sources: Vec::new(),
-        });
+        let es_access = resolve_es_access(
+            &config.es,
+            &ResolvedDataAccess {
+                data_sources: Vec::new(),
+            },
+        );
         let allowed = allowed_tool_names(
             &config,
             &registry,
@@ -13793,26 +15007,29 @@ mod tests {
         let knowledge_base = test_knowledge_base(&temp_dir, Some("alice"));
         let mut record = test_record(&temp_dir, Some("alice"));
         record.project_id = Some("project-1".to_string());
-        let es_access = resolve_es_access(&config.es, &ResolvedDataAccess {
-            data_sources: vec![DataSourceRecord {
-                id: "source-es".to_string(),
-                knowledge_base_id: knowledge_base.id,
-                tenant_id: None,
-                owner_id: Some("alice".to_string()),
-                name: "资料库检索".to_string(),
-                kind: DataSourceKind::Es,
-                description: None,
-                config: serde_json::json!({
-                    "endpoint": "http://127.0.0.1:9200",
-                    "index": "docs"
-                }),
-                status: Some("ready".to_string()),
-                last_test: None,
-                last_synced_at_ms: None,
-                created_at_ms: 1,
-                updated_at_ms: 2,
-            }],
-        });
+        let es_access = resolve_es_access(
+            &config.es,
+            &ResolvedDataAccess {
+                data_sources: vec![DataSourceRecord {
+                    id: "source-es".to_string(),
+                    knowledge_base_id: knowledge_base.id,
+                    tenant_id: None,
+                    owner_id: Some("alice".to_string()),
+                    name: "资料库检索".to_string(),
+                    kind: DataSourceKind::Es,
+                    description: None,
+                    config: serde_json::json!({
+                        "endpoint": "http://127.0.0.1:9200",
+                        "index": "docs"
+                    }),
+                    status: Some("ready".to_string()),
+                    last_test: None,
+                    last_synced_at_ms: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                }],
+            },
+        );
 
         let allowed = allowed_tool_names(
             &config,
@@ -14244,7 +15461,9 @@ mod tests {
             guard.record.id = "thread-source".to_string();
             guard
                 .session
-                .push_message(runtime::ConversationMessage::user_text("需要专家复盘的原始问题"))
+                .push_message(runtime::ConversationMessage::user_text(
+                    "需要专家复盘的原始问题",
+                ))
                 .expect("append source message");
             guard
                 .session
@@ -14278,11 +15497,7 @@ mod tests {
             .join("alice")
             .join("chat");
         fs::create_dir_all(&managed_root).expect("create managed workspace");
-        fs::write(
-            repo_root.join("CLAUDE.md"),
-            "X".repeat(32_000),
-        )
-        .expect("write large CLAUDE.md");
+        fs::write(repo_root.join("CLAUDE.md"), "X".repeat(32_000)).expect("write large CLAUDE.md");
 
         let mut config = test_config(repo_root.clone());
         config.data_dir = repo_root.join(".clawd");
@@ -14474,10 +15689,7 @@ mod tests {
         .expect("summary artifact should be stored");
         let summary_value: Value =
             serde_json::from_str(&summary_output).expect("parse summary output");
-        assert_eq!(
-            summary_value["metadata"]["stage"].as_str(),
-            Some("phase_4")
-        );
+        assert_eq!(summary_value["metadata"]["stage"].as_str(), Some("phase_4"));
 
         let expert_output = execute_artifact_emit(
             &state,
@@ -14497,10 +15709,7 @@ mod tests {
         .expect("expert artifact should be stored");
         let expert_value: Value =
             serde_json::from_str(&expert_output).expect("parse expert output");
-        assert_eq!(
-            expert_value["metadata"]["stage"].as_str(),
-            Some("phase_1")
-        );
+        assert_eq!(expert_value["metadata"]["stage"].as_str(), Some("phase_1"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
@@ -14615,7 +15824,10 @@ mod tests {
             Some("https://models.example.test/v1")
         );
         assert_eq!(project.model_access.base_url_env, None);
-        assert_eq!(project.model_access.api_key.as_deref(), Some("project-secret"));
+        assert_eq!(
+            project.model_access.api_key.as_deref(),
+            Some("project-secret")
+        );
         assert_eq!(
             project.model_access.api_key_env.as_deref(),
             Some("PROJECT_MODEL_API_KEY")
@@ -15185,9 +16397,7 @@ mod tests {
             .upsert_data_source(&data_source)
             .expect("persist data source");
 
-        let loaded_knowledge_bases = store
-            .load_knowledge_bases()
-            .expect("load knowledge bases");
+        let loaded_knowledge_bases = store.load_knowledge_bases().expect("load knowledge bases");
         assert_eq!(loaded_knowledge_bases.len(), 1);
         assert_eq!(loaded_knowledge_bases[0].id, knowledge_base.id);
         assert_eq!(loaded_knowledge_bases[0].name, "研发资料库");
@@ -15225,7 +16435,10 @@ mod tests {
         fs::create_dir_all(&project.workspace_root).expect("create project workspace");
 
         let state = Arc::new(AppState::new(config).expect("create app state"));
-        state.store.upsert_project(&project).expect("persist project");
+        state
+            .store
+            .upsert_project(&project)
+            .expect("persist project");
 
         let mut headers = HeaderMap::new();
         headers.insert("x-clawd-user-id", "alice".parse().expect("user id header"));
@@ -15250,8 +16463,14 @@ mod tests {
 
         let snapshot = response.0;
         assert_eq!(snapshot.project_id.as_deref(), Some(project.id.as_str()));
-        assert_eq!(snapshot.project_name.as_deref(), Some(project.name.as_str()));
-        assert_eq!(snapshot.workspace_root, project.workspace_root.display().to_string());
+        assert_eq!(
+            snapshot.project_name.as_deref(),
+            Some(project.name.as_str())
+        );
+        assert_eq!(
+            snapshot.workspace_root,
+            project.workspace_root.display().to_string()
+        );
         assert_eq!(snapshot.topic.as_deref(), Some("project scoped thread"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
@@ -15302,9 +16521,12 @@ mod tests {
         let mut record = test_record(&temp_dir, Some("alice"));
         record.workspace_root = config.managed_workspace_root(None, "alice");
 
-        let es_access = resolve_es_access(&config.es, &ResolvedDataAccess {
-            data_sources: Vec::new(),
-        });
+        let es_access = resolve_es_access(
+            &config.es,
+            &ResolvedDataAccess {
+                data_sources: Vec::new(),
+            },
+        );
         let allowed = allowed_tool_names(
             &config,
             &registry,
@@ -15507,7 +16729,10 @@ mod tests {
             .iter()
             .find(|record| record.kind == "run_started")
             .expect("run_started audit exists");
-        let payload = run_started.payload.as_object().expect("run_started payload object");
+        let payload = run_started
+            .payload
+            .as_object()
+            .expect("run_started payload object");
         let expert_panel = payload
             .get("expert_panel")
             .and_then(Value::as_object)
@@ -15808,6 +17033,144 @@ mod tests {
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
 
+    #[test]
+    fn persist_research_task_state_appends_visible_state() {
+        let temp_dir = test_temp_dir("research-task-state");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let store = Arc::new(ThreadStore::open(&config).expect("open sqlite store"));
+        let mut record = test_record(&temp_dir, Some("alice"));
+        record.artifacts.clear();
+        fs::create_dir_all(&record.workspace_root).expect("create workspace");
+
+        let mut session = Session::new();
+        session
+            .push_message(runtime::ConversationMessage::user_text("分析中美 AI 竞争"))
+            .expect("push user message");
+        session
+            .push_message(runtime::ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text {
+                    text: "### 米尔斯海默\n现实主义判断".to_string(),
+                },
+            ]))
+            .expect("push expert message");
+        session
+            .push_message(runtime::ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text {
+                    text: "### Final synthesis\n综合判断".to_string(),
+                },
+            ]))
+            .expect("push synthesis");
+
+        let thread = Arc::new(ManagedThread::new(ThreadState {
+            record: record.clone(),
+            visible_memory_notes: record.memory_notes.clone(),
+            audit_records: Vec::new(),
+            session,
+            status: ThreadStatus::Idle,
+            last_error: None,
+            draft_assistant_text: String::new(),
+            next_run_id: 1,
+            current_run: None,
+            pending_replan: None,
+        }));
+        persist_thread_state(&thread, &store).expect("persist thread");
+
+        let state = Arc::new(AppState {
+            config,
+            store,
+            admission: Mutex::new(()),
+            mutation_rate_limiter: Mutex::new(MutationRateLimiter::default()),
+            threads: RwLock::new(HashMap::new()),
+        });
+
+        append_thread_audit(
+            &state.store,
+            &thread,
+            "run_started",
+            Some(1),
+            json!({
+                "prompt": "整理为报告",
+            }),
+        )
+        .expect("append write intent audit");
+        persist_research_task_state(&state, &thread).expect("persist research task state");
+
+        let snapshot = thread.snapshot();
+        let payload = snapshot
+            .audit_records
+            .iter()
+            .find(|record| record.kind == "research_task_state")
+            .map(|record| record.payload.clone())
+            .expect("research task state audit");
+        let parsed: ResearchTaskStateRecord =
+            serde_json::from_value(payload).expect("deserialize research task state");
+
+        assert_eq!(parsed.status, ResearchTaskStage::WritingReady);
+        assert_eq!(parsed.status_label, "可进入写作整理");
+        assert_eq!(parsed.next_recommended_action, "整理综合结论并生成正式报告");
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn persist_research_task_state_skips_duplicate_state() {
+        let temp_dir = test_temp_dir("research-task-state-dedupe");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let store = Arc::new(ThreadStore::open(&config).expect("open sqlite store"));
+        let record = test_record(&temp_dir, Some("alice"));
+        fs::create_dir_all(&record.workspace_root).expect("create workspace");
+
+        let mut session = Session::new();
+        session
+            .push_message(runtime::ConversationMessage::user_text("分析中美 AI 竞争"))
+            .expect("push user message");
+
+        let thread = Arc::new(ManagedThread::new(ThreadState {
+            record: record.clone(),
+            visible_memory_notes: record.memory_notes.clone(),
+            audit_records: Vec::new(),
+            session,
+            status: ThreadStatus::Idle,
+            last_error: None,
+            draft_assistant_text: String::new(),
+            next_run_id: 1,
+            current_run: None,
+            pending_replan: None,
+        }));
+        persist_thread_state(&thread, &store).expect("persist thread");
+
+        let state = Arc::new(AppState {
+            config,
+            store,
+            admission: Mutex::new(()),
+            mutation_rate_limiter: Mutex::new(MutationRateLimiter::default()),
+            threads: RwLock::new(HashMap::new()),
+        });
+
+        append_thread_audit(
+            &state.store,
+            &thread,
+            "run_started",
+            Some(1),
+            json!({
+                "prompt": "整理为报告",
+            }),
+        )
+        .expect("append write intent audit");
+        persist_research_task_state(&state, &thread).expect("persist first state");
+        persist_research_task_state(&state, &thread).expect("persist duplicate state");
+
+        let snapshot = thread.snapshot();
+        let count = snapshot
+            .audit_records
+            .iter()
+            .filter(|record| record.kind == "research_task_state")
+            .count();
+        assert_eq!(count, 1);
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
     #[tokio::test]
     async fn expert_panel_run_uses_override_execution_context_for_expert_turns() {
         let temp_dir = test_temp_dir("expert-panel-override-context");
@@ -15815,7 +17178,8 @@ mod tests {
         let workspace_root = temp_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("create workspace");
         let success_body = r#"{"id":"msg-1","model":"gpt-4o","choices":[{"message":{"role":"assistant","content":"captured response"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
-        let (capturing_model_base_url, captured_requests) = spawn_openai_capture_server(success_body);
+        let (capturing_model_base_url, captured_requests) =
+            spawn_openai_capture_server(success_body);
 
         let state = Arc::new(AppState::new(config).expect("create app state"));
         let mut knowledge_base = test_knowledge_base(&temp_dir, Some("alice"));
@@ -16128,7 +17492,10 @@ mod tests {
         .expect("load persisted expert panel run")
         .0;
         assert_eq!(loaded.status, ExpertPanelRunStatus::Succeeded);
-        assert_eq!(loaded.experts[0].content.as_deref(), Some("captured synthesis"));
+        assert_eq!(
+            loaded.experts[0].content.as_deref(),
+            Some("captured synthesis")
+        );
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
@@ -16514,6 +17881,67 @@ mod tests {
             memory_workspace_root.as_deref(),
             Some(record.workspace_root.display().to_string().as_str())
         );
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn persist_research_task_state_keeps_synthesis_without_explicit_write_action() {
+        let temp_dir = test_temp_dir("research-task-state-synthesis-boundary");
+        let config = Arc::new(test_config(temp_dir.clone()));
+        let store = Arc::new(ThreadStore::open(&config).expect("open sqlite store"));
+        let record = test_record(&temp_dir, Some("alice"));
+        fs::create_dir_all(&record.workspace_root).expect("create workspace");
+
+        let mut session = Session::new();
+        session
+            .push_message(runtime::ConversationMessage::user_text("分析中美 AI 竞争"))
+            .expect("push user message");
+        session
+            .push_message(runtime::ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text {
+                    text: "### Final synthesis\n综合判断".to_string(),
+                },
+            ]))
+            .expect("push synthesis");
+
+        let thread = Arc::new(ManagedThread::new(ThreadState {
+            record: record.clone(),
+            visible_memory_notes: record.memory_notes.clone(),
+            audit_records: Vec::new(),
+            session,
+            status: ThreadStatus::Idle,
+            last_error: None,
+            draft_assistant_text: String::new(),
+            next_run_id: 1,
+            current_run: None,
+            pending_replan: None,
+        }));
+        persist_thread_state(&thread, &store).expect("persist thread");
+
+        let state = Arc::new(AppState {
+            config,
+            store,
+            admission: Mutex::new(()),
+            mutation_rate_limiter: Mutex::new(MutationRateLimiter::default()),
+            threads: RwLock::new(HashMap::new()),
+        });
+
+        persist_research_task_state(&state, &thread).expect("persist research task state");
+
+        let snapshot = thread.snapshot();
+        let payload = snapshot
+            .audit_records
+            .iter()
+            .find(|record| record.kind == "research_task_state")
+            .map(|record| record.payload.clone())
+            .expect("research task state audit");
+        let parsed: ResearchTaskStateRecord =
+            serde_json::from_value(payload).expect("deserialize research task state");
+
+        assert_eq!(parsed.status, ResearchTaskStage::Synthesis);
+        assert_eq!(parsed.status_label, "已形成综合判断");
+        assert_eq!(parsed.next_recommended_action, "补充证据或直接整理为报告");
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
