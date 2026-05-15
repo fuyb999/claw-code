@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -228,7 +227,7 @@ impl AgUiEvent {
         Self::TextMessageContent {
             message_id: message_id.to_string(),
             delta: delta.to_string(),
-            timestamp: now_millis(),
+            timestamp: crate::now_millis(),
         }
     }
 }
@@ -236,13 +235,6 @@ impl AgUiEvent {
 pub fn encode_ag_ui_sse_frame(event: &AgUiEvent) -> Result<String, serde_json::Error> {
     let payload = serde_json::to_string(event)?;
     Ok(format!("data: {payload}\n\n"))
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]
