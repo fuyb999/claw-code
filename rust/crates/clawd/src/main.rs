@@ -10570,6 +10570,7 @@ fn execute_single_expert_attempt(
         &document_access,
         &web_access,
         &db_access,
+        PromptSurface::Legacy,
     )
     .map_err(|error| {
         expert_failure_from_error(input.expert.clone(), input.attempt, error.to_string())
@@ -10594,6 +10595,7 @@ fn execute_single_expert_attempt(
     let tool_executor = ServiceToolExecutor::new(
         tool_registry,
         allowed_tools,
+        PromptSurface::Legacy,
         base_record.workspace_root.clone(),
         es_access,
         document_access,
@@ -11080,15 +11082,29 @@ fn execute_run_with_agent_sink(
     let document_access = resolve_document_access(&data_access);
     let web_access = resolve_web_access(&data_access);
     let db_access = resolve_db_access(&data_access);
-    let allowed_tools = allowed_tool_names(
-        &state.config,
-        &tool_registry,
-        &effective_record,
-        &es_access,
-        &document_access,
-        &web_access,
-        &db_access,
-    );
+    let allowed_tools = if agent_event_sink.is_some() {
+        webagent_allowed_tool_names(
+            es_access.base_url.is_some(),
+            !document_access.files.is_empty(),
+            !web_access.urls.is_empty(),
+            db_access.url.is_some(),
+        )
+    } else {
+        allowed_tool_names(
+            &state.config,
+            &tool_registry,
+            &effective_record,
+            &es_access,
+            &document_access,
+            &web_access,
+            &db_access,
+        )
+    };
+    let prompt_surface = if agent_event_sink.is_some() {
+        PromptSurface::WebAgent
+    } else {
+        PromptSurface::Legacy
+    };
     let policy =
         permission_policy(permission_mode, &tool_registry, &allowed_tools).map_err(|error| {
             RunFailure {
@@ -11104,6 +11120,7 @@ fn execute_run_with_agent_sink(
         &document_access,
         &web_access,
         &db_access,
+        prompt_surface,
     )
     .map_err(|error| RunFailure {
         error: error.to_string(),
@@ -11128,6 +11145,7 @@ fn execute_run_with_agent_sink(
     let tool_executor = ServiceToolExecutor::new(
         tool_registry,
         allowed_tools,
+        prompt_surface,
         record.workspace_root.clone(),
         es_access,
         document_access,
@@ -11231,6 +11249,12 @@ impl AgentTurnRecordRuntimeExt for AgentTurnRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptSurface {
+    Legacy,
+    WebAgent,
+}
+
 fn build_system_prompt(
     config: &AppConfig,
     record: &ThreadRecord,
@@ -11239,6 +11263,7 @@ fn build_system_prompt(
     document_access: &ResolvedDocumentAccess,
     web_access: &ResolvedWebAccess,
     db_access: &ResolvedDbAccess,
+    surface: PromptSurface,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let date = current_date_iso();
     let managed_root = config.managed_workspaces_dir();
@@ -11269,13 +11294,22 @@ fn build_system_prompt(
         .topic
         .clone()
         .unwrap_or_else(|| "未显式设置主题，请从用户消息中推断".to_string());
+    let memory_contract = match surface {
+        PromptSurface::WebAgent => {
+            "- Use MemorySearch before repeating prior analysis. Search user, tenant, or current session memory when conclusions should survive beyond the current conversation.\n\
+- Use MemoryWrite to persist stable findings or scope boundaries. Use user memory for personal reusable conclusions, tenant memory for cross-user conclusions worth sharing, and current session memory for conversation-local notes."
+        }
+        PromptSurface::Legacy => {
+            "- Use MemorySearch before repeating prior analysis. Search `scope: \"workspace\"`, `scope: \"tenant\"`, or `scope: \"all\"` when conclusions should survive beyond the current thread.\n\
+- Use MemoryWrite to persist stable findings or scope boundaries. Use `scope: \"workspace\"` for conclusions shared by the same user in the same workspace, `scope: \"tenant\"` for conclusions worth sharing across the tenant, and `scope: \"thread\"` for thread-local notes."
+        }
+    };
     prompt.push(format!(
         "# Web Agent Contract\n\
 Current topic: {topic}\n\
 - Focus on the topic unless new evidence clearly requires scope adjustment.\n\
 - Search before summarizing when evidence is incomplete.\n\
-- Use MemorySearch before repeating prior analysis. Search `scope: \"workspace\"`, `scope: \"tenant\"`, or `scope: \"all\"` when conclusions should survive beyond the current thread.\n\
-- Use MemoryWrite to persist stable findings or scope boundaries. Use `scope: \"workspace\"` for conclusions shared by the same user in the same workspace, `scope: \"tenant\"` for conclusions worth sharing across the tenant, and `scope: \"thread\"` for thread-local notes.\n\
+{memory_contract}\n\
 - Use TopicDriftCheck when you suspect your reasoning is drifting away from the topic.\n\
 - Use ArtifactEmit when the result should be rendered as markdown, table, chart, or graph.\n\
 - During multi-expert workflows, use ExpertPanelEmit to register each expert view and final synthesis as structured panel progress.\n\
@@ -11293,20 +11327,42 @@ Follow these project defaults unless the latest user request explicitly override
 {instructions}"
         ));
     }
-    if !record.preferred_skill_names.is_empty() {
+    let preferred_skill_names = record
+        .preferred_skill_names
+        .iter()
+        .filter(|name| {
+            matches!(surface, PromptSurface::Legacy) || !name.trim().starts_with("workspace:")
+        })
+        .collect::<Vec<_>>();
+    if !preferred_skill_names.is_empty() {
+        let preferred_skill_policy = match surface {
+            PromptSurface::WebAgent => {
+                "When they match the task, load these platform or tenant skills before general analysis."
+            }
+            PromptSurface::Legacy => {
+                "When they match the task, load these before falling back to generic exploration."
+            }
+        };
         prompt.push(format!(
             "# Preferred Skills\n\
-When they match the task, load these before falling back to generic exploration.\n\
+{preferred_skill_policy}\n\
 {}",
-            record
-                .preferred_skill_names
-                .iter()
+            preferred_skill_names
+                .into_iter()
                 .map(|name| format!("- {name}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
     }
     if let Some(expert_panel) = request.expert_panel.as_ref() {
+        let expert_source_policy = match surface {
+            PromptSurface::WebAgent => {
+                "- When Elasticsearch sources are connected, each expert should call `EsSearch` before summarizing. Local code, prompt files, and local project inspection tools are unavailable in WebAgent runs."
+            }
+            PromptSurface::Legacy => {
+                "- When Elasticsearch sources are connected, each expert should call `EsSearch` before using workspace file tools. Do not treat local code or prompt files as primary evidence for a research question."
+            }
+        };
         let experts = expert_panel
             .experts
             .iter()
@@ -11342,7 +11398,7 @@ This run is a structured multi-expert workflow.\n\
 - Do not merge experts into one paragraph. Produce one visible expert opinion per selected expert before final synthesis.\n\
 - For each selected expert, call `Skill` with that expert skill name, follow its retrieval guidance, then emit a dedicated expert result card.\n\
 - If the current thread has connected sources, each expert should search those sources independently instead of reusing another expert's conclusion as evidence.\n\
-- When Elasticsearch sources are connected, each expert should call `EsSearch` before using workspace file tools. Do not treat local code or prompt files as primary evidence for a research question.\n\
+{expert_source_policy}\n\
 - The user should see expert opinions and the final synthesis, but should not see hidden orchestration text, internal prompts, or raw skill payloads.\n\
 - Reuse the exact panel id in ExpertPanelEmit.panel_id and ArtifactEmit.metadata.panel.\n\
 - Group artifacts with metadata.group = expert_view, expert_consensus, or expert_summary.\n\
@@ -11420,11 +11476,18 @@ This run is a structured multi-expert workflow.\n\
                     .unwrap_or_default()
             ));
         }
+        let source_policy = match surface {
+            PromptSurface::WebAgent => {
+                "- Use these connected platform sources as the evidence boundary for this WebAgent run. Local file-system exploration, shell commands, and local project inspection tools are unavailable."
+            }
+            PromptSurface::Legacy => {
+                "- Prefer these connected sources before falling back to generic file-system exploration."
+            }
+        };
         prompt.push(format!(
-            "# Connected Data Sources\n\
-{}\n\
-- Prefer these connected sources before falling back to generic file-system exploration.",
-            access_notes.join("\n")
+            "# Connected Data Sources\n{}\n{}",
+            access_notes.join("\n"),
+            source_policy
         ));
     }
     if request
@@ -11442,12 +11505,20 @@ This run is a structured multi-expert workflow.\n\
                 .clone()
                 .unwrap_or_else(|| "未设置索引".to_string())
         };
+        let retrieval_policy = match surface {
+            PromptSurface::WebAgent => {
+                "- Local file, shell, grep, glob, read, write, and edit tools are unavailable in WebAgent runs. If platform retrieval is empty, state the evidence gap and continue with bounded analysis instead of using local files."
+            }
+            PromptSurface::Legacy => {
+                "- Do not use workspace file tools (`read_file`, `grep_search`, `glob_search`) as primary evidence unless Elasticsearch retrieval is empty or the user explicitly asked for code/workspace inspection."
+            }
+        };
         prompt.push(format!(
             "# Retrieval Priority\n\
 - Auto retrieval is ON for this run.\n\
 - Start with `EsSearch` against the connected Elasticsearch scope ({index_label}) before summarizing.\n\
 - Use concrete query phrases derived from the user's question.\n\
-- Do not use workspace file tools (`read_file`, `grep_search`, `glob_search`) as primary evidence unless Elasticsearch retrieval is empty or the user explicitly asked for code/workspace inspection."
+{retrieval_policy}"
         ));
     }
     if matches!(request.kind, RunKind::Replan) {
@@ -11469,6 +11540,9 @@ and propose a tighter path before continuing detailed synthesis."
     if !available_skills.is_empty() {
         let inventory = available_skills
             .into_iter()
+            .filter(|entry| {
+                matches!(surface, PromptSurface::Legacy) || entry.scope != SkillScope::Workspace
+            })
             .map(|entry| {
                 let description = entry
                     .description
@@ -11478,10 +11552,18 @@ and propose a tighter path before continuing detailed synthesis."
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let skill_selection_policy = match surface {
+            PromptSurface::WebAgent => {
+                "Use platform or tenant skills when they match. Local project skills are unavailable in WebAgent runs."
+            }
+            PromptSurface::Legacy => {
+                "When a workspace and tenant skill share the same name, prefer the workspace skill unless the tenant one is explicitly requested."
+            }
+        };
         prompt.push(format!(
             "# Available Skills\n\
 Load one with `Skill` before following it when the workflow matches.\n\
-When a workspace and tenant skill share the same name, prefer the workspace skill unless the tenant one is explicitly requested.\n\
+{skill_selection_policy}\n\
 {inventory}"
         ));
     }
@@ -11743,6 +11825,7 @@ impl runtime::ApiClient for ServiceApiClient {
 struct ServiceToolExecutor {
     tool_registry: GlobalToolRegistry,
     allowed_tools: BTreeSet<String>,
+    surface: PromptSurface,
     workspace_root: PathBuf,
     es_access: ResolvedEsAccess,
     document_access: ResolvedDocumentAccess,
@@ -11759,6 +11842,7 @@ impl ServiceToolExecutor {
     fn new(
         tool_registry: GlobalToolRegistry,
         allowed_tools: BTreeSet<String>,
+        surface: PromptSurface,
         workspace_root: PathBuf,
         es_access: ResolvedEsAccess,
         document_access: ResolvedDocumentAccess,
@@ -11773,6 +11857,7 @@ impl ServiceToolExecutor {
         Self {
             tool_registry,
             allowed_tools,
+            surface,
             workspace_root,
             es_access,
             document_access,
@@ -11810,9 +11895,7 @@ impl ToolExecutor for ServiceToolExecutor {
         if self.abort_signal.is_aborted() {
             return Err(ToolError::new("run interrupted by user"));
         }
-        if !self.allowed_tools.contains(tool_name)
-            && !self.tool_registry.has_runtime_tool(tool_name)
-        {
+        if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled in clawd"
             )));
@@ -11821,7 +11904,7 @@ impl ToolExecutor for ServiceToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let value = rewrite_tool_input(tool_name, value, &self.workspace_root)?;
         let result = if tool_name == "Skill" {
-            execute_service_skill(&self.state.config, &self.thread, value)
+            execute_service_skill(&self.state.config, &self.thread, self.surface, value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {
@@ -11960,19 +12043,33 @@ struct ServiceSkillInput {
 fn execute_service_skill(
     config: &AppConfig,
     thread: &Arc<ManagedThread>,
+    surface: PromptSurface,
     value: Value,
 ) -> Result<String, ToolError> {
     let input: ServiceSkillInput = serde_json::from_value(value)
         .map_err(|error| ToolError::new(format!("invalid Skill input: {error}")))?;
+    let (requested_scope, _) =
+        parse_requested_skill(&input.skill).map_err(|error| ToolError::new(error.to_string()))?;
+    if matches!(surface, PromptSurface::WebAgent)
+        && matches!(requested_scope, Some(SkillScope::Workspace))
+    {
+        return Err(ToolError::new(
+            "workspace-scoped skills are unavailable in WebAgent runs",
+        ));
+    }
     let record = thread
         .shared
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record
         .clone();
+    let workspace_root = match surface {
+        PromptSurface::Legacy => Some(record.workspace_root.as_path()),
+        PromptSurface::WebAgent => None,
+    };
     let detail = resolve_service_skill(
         config,
-        Some(&record.workspace_root),
+        workspace_root,
         record.tenant_id.as_deref(),
         &input.skill,
     )
@@ -13276,6 +13373,36 @@ fn allowed_tool_names(
                 }),
         )
         .collect()
+}
+
+fn webagent_allowed_tool_names(
+    has_es_access: bool,
+    has_document_access: bool,
+    has_web_access: bool,
+    has_db_access: bool,
+) -> BTreeSet<String> {
+    let mut allowed = BTreeSet::from([
+        "Skill".to_string(),
+        "MemoryWrite".to_string(),
+        "MemorySearch".to_string(),
+        "TopicDriftCheck".to_string(),
+        "ArtifactEmit".to_string(),
+        "ExpertPanelEmit".to_string(),
+    ]);
+    if has_es_access {
+        allowed.insert("EsSearch".to_string());
+    }
+    if has_document_access {
+        allowed.insert("SourceSearch".to_string());
+        allowed.insert("SourceRead".to_string());
+    }
+    if has_web_access {
+        allowed.insert("SourceWebFetch".to_string());
+    }
+    if has_db_access {
+        allowed.insert("DbQuery".to_string());
+    }
+    allowed
 }
 
 fn restrict_expert_file_tools_for_es(
@@ -15597,17 +15724,18 @@ mod tests {
         post_thread_command, provider_client_from_record, provider_kind_for_model_access,
         render_skill_prompt, renumber_agent_tool_updates, request_model_for_model_access,
         resolve_es_access, resolve_service_skill, rewrite_tool_input, sqlite_path_from_url,
-        thread_is_visible_to_auth, ActiveRun, AppConfig, AppState, ArtifactKind, ArtifactRecord,
-        AuditRecord, AuthContext, AuthMode, CapacityUsage, CommandRequest, DataSourceKind,
-        DataSourceRecord, DocumentFileRecord, EsConfig, ExpertPanelExpert, ExpertPanelExpertStatus,
-        ExpertPanelRequest, ExpertPanelRunExpertState, ExpertPanelRunRequest,
-        ExpertPanelRunResponse, ExpertPanelRunStatus, KnowledgeBaseRecord, ManagedThread,
-        MemoryNote, MemoryScope, MemorySearchScope, MessageBlockSnapshot, ModelAccessConfig,
-        MutationRateLimiter, MutationRateUsage, ProjectRecord, ProviderKind, ResearchTaskStage,
-        ResearchTaskStateRecord, ResolvedDataAccess, ResolvedDbAccess, ResolvedDocumentAccess,
-        ResolvedEsAccess, ResolvedWebAccess, RunKind, RunRequest, SkillScope, ThreadRecord,
-        ThreadState, ThreadStatus, ThreadStore, UpdateProjectRequest,
-        CURRENT_DATABASE_SCHEMA_VERSION, MAX_VISIBLE_AUDIT_RECORDS,
+        thread_is_visible_to_auth, webagent_allowed_tool_names, ActiveRun, AppConfig, AppState,
+        ArtifactKind, ArtifactRecord, AuditRecord, AuthContext, AuthMode, CapacityUsage,
+        CommandRequest, DataSourceKind, DataSourceRecord, DocumentFileRecord, EsConfig,
+        ExpertPanelExpert, ExpertPanelExpertStatus, ExpertPanelRequest, ExpertPanelRunExpertState,
+        ExpertPanelRunRequest, ExpertPanelRunResponse, ExpertPanelRunStatus, KnowledgeBaseRecord,
+        ManagedThread, MemoryNote, MemoryScope, MemorySearchScope, MessageBlockSnapshot,
+        ModelAccessConfig, MutationRateLimiter, MutationRateUsage, ProjectRecord, PromptSurface,
+        ProviderKind, ResearchTaskStage, ResearchTaskStateRecord, ResolvedDataAccess,
+        ResolvedDbAccess, ResolvedDocumentAccess, ResolvedEsAccess, ResolvedWebAccess,
+        RunExecutionContext, RunKind, RunRequest, SkillScope, ThreadRecord, ThreadState,
+        ThreadStatus, ThreadStore, UpdateProjectRequest, CURRENT_DATABASE_SCHEMA_VERSION,
+        MAX_VISIBLE_AUDIT_RECORDS,
     };
     use crate::agent_turns::{
         AgentConversationRecord, AgentConversationStatus, AgentTurnRecord, AgentTurnStatus,
@@ -16636,6 +16764,7 @@ mod tests {
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
             &ResolvedDbAccess::default(),
+            PromptSurface::Legacy,
         )
         .expect("build system prompt")
         .join("\n\n");
@@ -16687,6 +16816,7 @@ mod tests {
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
             &ResolvedDbAccess::default(),
+            PromptSurface::Legacy,
         )
         .expect("build system prompt")
         .join("\n\n");
@@ -16898,6 +17028,7 @@ mod tests {
             &ResolvedDocumentAccess::default(),
             &ResolvedWebAccess::default(),
             &ResolvedDbAccess::default(),
+            PromptSurface::Legacy,
         )
         .expect("build prompt")
         .join("\n\n");
@@ -16905,6 +17036,140 @@ mod tests {
         assert!(prompt.contains("# Web Agent Contract"));
         assert!(!prompt.contains(&"X".repeat(128)));
         assert!(prompt.len() < 200_000);
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn webagent_system_prompt_excludes_local_file_tool_fallbacks() {
+        let temp_dir = test_temp_dir("webagent-prompt-no-local-tools");
+        let mut config = test_config(temp_dir.clone());
+        config.es.base_url = Some("http://127.0.0.1:9200".to_string());
+        let mut record = test_record(&temp_dir, Some("alice"));
+        record.project_id = None;
+        record.workspace_root = config.managed_workspace_root(None, "alice");
+        let workspace_skill_dir = record
+            .workspace_root
+            .join(".claw")
+            .join("skills")
+            .join("local-only");
+        fs::create_dir_all(&workspace_skill_dir).expect("create workspace skill dir");
+        fs::write(
+            workspace_skill_dir.join("SKILL.md"),
+            render_skill_prompt("local-only", Some("local skill"), &[], None, "local"),
+        )
+        .expect("write workspace skill");
+
+        let prompt = build_system_prompt(
+            &config,
+            &record,
+            &RunRequest {
+                kind: RunKind::UserMessage,
+                prompt: "检索平台资料".to_string(),
+                expert_panel: Some(ExpertPanelRequest {
+                    panel_id: "panel-1".to_string(),
+                    master_skill: "expert-brainstorm".to_string(),
+                    experts: vec![ExpertPanelExpert {
+                        label: "Howard-Wang".to_string(),
+                        skill: "howard-wang".to_string(),
+                        scope: SkillScope::Tenant,
+                        description: None,
+                    }],
+                }),
+                expert_run: None,
+                execution_context: Some(RunExecutionContext {
+                    knowledge_base_id: None,
+                    data_source_ids: Some(vec!["source-es".to_string()]),
+                    knowledge_base_name: None,
+                    auto_retrieval: Some(true),
+                }),
+            },
+            &ResolvedEsAccess {
+                base_url: Some("http://127.0.0.1:9200".to_string()),
+                api_key: None,
+                username: None,
+                password: None,
+                default_index: Some("docs".to_string()),
+                indices: vec!["docs".to_string()],
+                source_id: Some("source-es".to_string()),
+                source_name: Some("平台 ES".to_string()),
+            },
+            &ResolvedDocumentAccess::default(),
+            &ResolvedWebAccess::default(),
+            &ResolvedDbAccess::default(),
+            PromptSurface::WebAgent,
+        )
+        .expect("build prompt")
+        .join("\n\n");
+
+        assert!(prompt.contains("Local file-system exploration"));
+        assert!(prompt.contains("user memory"));
+        assert!(prompt.contains("tenant memory"));
+        assert!(prompt.contains("current session memory"));
+        assert!(!prompt.contains("scope: \"workspace\""));
+        assert!(!prompt.contains("workspace file tools"));
+        assert!(!prompt.contains("workspace-scoped skills"));
+        assert!(!prompt.contains("prefer the workspace skill"));
+        assert!(!prompt.contains("workspace:local-only"));
+        assert!(!prompt.contains("workspace:repo-map"));
+        assert!(!prompt.contains("generic file-system exploration"));
+        assert!(!prompt.contains("read_file"));
+        assert!(!prompt.contains("grep_search"));
+        assert!(!prompt.contains("glob_search"));
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn webagent_skill_execution_rejects_workspace_scoped_skills() {
+        let temp_dir = test_temp_dir("webagent-skill-no-workspace");
+        let config = test_config(temp_dir.clone());
+        let workspace = temp_dir.join("workspace");
+        let workspace_skill_dir = workspace.join(".claw").join("skills").join("repo-map");
+        let tenant_skill_dir = config.tenant_skills_dir("tenant-a").join("report");
+        fs::create_dir_all(&workspace_skill_dir).expect("create workspace skill dir");
+        fs::create_dir_all(&tenant_skill_dir).expect("create tenant skill dir");
+        fs::write(
+            workspace_skill_dir.join("SKILL.md"),
+            render_skill_prompt("repo-map", Some("workspace"), &[], None, "workspace"),
+        )
+        .expect("write workspace skill");
+        fs::write(
+            tenant_skill_dir.join("SKILL.md"),
+            render_skill_prompt("report", Some("tenant report"), &[], None, "tenant"),
+        )
+        .expect("write tenant skill");
+
+        let thread = Arc::new(test_thread(Some("alice")));
+        {
+            let mut guard = thread
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.record.tenant_id = Some("tenant-a".to_string());
+            guard.record.workspace_root = workspace;
+        }
+
+        let workspace_error = super::execute_service_skill(
+            &config,
+            &thread,
+            PromptSurface::WebAgent,
+            json!({ "skill": "workspace:repo-map" }),
+        )
+        .expect_err("workspace skill should be rejected");
+        assert!(workspace_error
+            .to_string()
+            .contains("workspace-scoped skills are unavailable"));
+
+        let tenant_output = super::execute_service_skill(
+            &config,
+            &thread,
+            PromptSurface::WebAgent,
+            json!({ "skill": "tenant:report" }),
+        )
+        .expect("tenant skill should load");
+        assert!(tenant_output.contains("tenant report"));
+        assert!(tenant_output.contains("tenant"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
@@ -17978,6 +18243,23 @@ mod tests {
         assert!(!allowed.contains("grep_search"));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn webagent_allowed_tools_exclude_local_workspace_tools() {
+        let allowed = webagent_allowed_tool_names(true, true, true, true);
+
+        assert!(allowed.contains("EsSearch"));
+        assert!(allowed.contains("SourceSearch"));
+        assert!(allowed.contains("SourceRead"));
+        assert!(allowed.contains("ArtifactEmit"));
+        assert!(!allowed.contains("read_file"));
+        assert!(!allowed.contains("write_file"));
+        assert!(!allowed.contains("edit_file"));
+        assert!(!allowed.contains("glob_search"));
+        assert!(!allowed.contains("grep_search"));
+        assert!(!allowed.contains("Bash"));
+        assert!(!allowed.contains("PowerShell"));
     }
 
     #[tokio::test]
