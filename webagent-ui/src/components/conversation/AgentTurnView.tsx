@@ -78,7 +78,11 @@ export function AgentTurnView({
             </div>
           ) : null}
 
-          <AgentActivityTimeline steps={turn.steps} />
+          <AgentActivityTimeline
+            citations={turn.citations}
+            expertResults={turn.expert_results}
+            steps={turn.steps}
+          />
           <AgentCitationList citations={turn.citations} />
           <AgentDebugDetails isAdmin={isAdmin} turn={turn} />
         </div>

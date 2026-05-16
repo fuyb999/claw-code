@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  groupAgentTurnSteps,
   groupTurnsByDisplayDate,
   replaceEvidenceMarkersWithCitationNumbers,
   statusLabelForAgentTurn,
@@ -34,5 +35,87 @@ describe("agent-turn helpers", () => {
   it("uses ordinary user status labels", () => {
     expect(statusLabelForAgentTurn("running")).toBe("正在处理");
     expect(statusLabelForAgentTurn("failed")).toBe("处理失败");
+  });
+
+  it("groups retrieval steps with action, output, and citation references", () => {
+    const groups = groupAgentTurnSteps(
+      [
+        {
+          id: "retrieval-1",
+          kind: "retrieval",
+          label: "检索资料库",
+          detail: "检索完成",
+          status: "succeeded",
+          started_at_ms: 100,
+          completed_at_ms: 200,
+          public_payload: {
+            query: "台海供应链",
+            hit_count: 3,
+            citation_numbers: [1, 2],
+          },
+          debug_payload: {
+            result_summary: "debug only",
+          },
+        },
+      ],
+      [],
+      [],
+    );
+
+    expect(groups).toEqual([
+      {
+        kind: "retrieval",
+        title: "资料检索",
+        items: [
+          {
+            id: "retrieval-1",
+            title: "检索资料库",
+            action: "查询：台海供应链",
+            output: "命中 3 篇资料，引用 [1] [2]",
+            status: "succeeded",
+            references: [1, 2],
+            detail: "检索完成",
+            started_at_ms: 100,
+            completed_at_ms: 200,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("adds expert results to the expert pipeline group", () => {
+    const groups = groupAgentTurnSteps(
+      [],
+      [],
+      [
+        {
+          expert_name: "Mearsheimer",
+          status: "succeeded",
+          summary: "大国竞争压力升高。",
+          citation_numbers: [2],
+          error: null,
+        },
+      ],
+    );
+
+    expect(groups).toEqual([
+      {
+        kind: "expert",
+        title: "专家分析",
+        items: [
+          {
+            id: "expert-result-Mearsheimer-0",
+            title: "Mearsheimer 分析",
+            action: "专家视角分析",
+            output: "大国竞争压力升高。",
+            status: "succeeded",
+            references: [2],
+            detail: null,
+            started_at_ms: null,
+            completed_at_ms: null,
+          },
+        ],
+      },
+    ]);
   });
 });

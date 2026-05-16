@@ -26,7 +26,12 @@ const turn: AgentTurnRecord = {
       status: "succeeded",
       started_at_ms: new Date("2026-05-15T14:32:04+08:00").getTime(),
       completed_at_ms: new Date("2026-05-15T14:32:07+08:00").getTime(),
-      public_payload: { citation_count: 1 },
+      public_payload: {
+        source_name: "平台资料库",
+        query: "台海供应链风险",
+        hit_count: 1,
+        citation_numbers: [1],
+      },
     },
   ],
   citations: [
@@ -56,7 +61,8 @@ describe("AgentTurnView", () => {
 
     expect(screen.getByText("分析台海供应链风险")).toBeInTheDocument();
     expect(screen.getByText(/主要风险来自运输节点。/)).toBeInTheDocument();
-    expect(screen.getByText("资料检索已返回")).toBeInTheDocument();
+    expect(screen.getByText("资料检索")).toBeInTheDocument();
+    expect(screen.getByText("命中 1 篇资料，引用 [1]")).toBeInTheDocument();
     expect(screen.getByText("引用资料")).toBeInTheDocument();
     expect(screen.getByText("供应链报告")).toBeInTheDocument();
     expect(screen.queryByText("TOOL_CALL_RESULT")).not.toBeInTheDocument();
