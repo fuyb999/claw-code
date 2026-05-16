@@ -1336,6 +1336,49 @@ git commit -m "fix: polish webagent chat acceptance"
 
 Skip this commit if no changes were required.
 
+### Task 7: Follow-up Chat Product Details
+
+**Files:**
+- Modify: `webagent-ui/src/components/conversation/AgentTurnView.tsx`
+- Modify: `webagent-ui/src/components/conversation/AgentTurnView.test.tsx`
+- Modify: `webagent-ui/src/components/conversation/AgentActivityTimeline.tsx`
+- Modify: `webagent-ui/src/components/conversation/AgentActivityTimeline.test.tsx`
+- Modify: `webagent-ui/src/hooks/useWebAgentSession.ts`
+- Modify: `webagent-ui/src/hooks/useWebAgentSession.test.ts`
+- Modify: `webagent-ui/src/lib/clawd/agent-turns.ts`
+- Modify: `webagent-ui/src/lib/clawd/agent-turns.test.ts`
+
+- [ ] **Step 1: Lock user question bubble sizing**
+
+Add a render test that verifies the user bubble uses content-sized layout (`w-fit` / `max-w-*`) rather than full-width stretching. Implement by making the user bubble `ml-auto w-fit max-w-[72%]`.
+
+- [ ] **Step 2: Add long-answer folding**
+
+Add a render test with long assistant text. Verify the answer is collapsed by default, shows `展开全文`, and toggles to `收起`. Implement a small local fold state in `AgentTurnView`; fold only when content is long enough.
+
+- [ ] **Step 3: Restore selected-expert execution in the pipeline**
+
+Add hook/model tests proving selected experts create or preserve expert pipeline items when a question is sent. Expert selection must appear in the current answer pipeline as `专家分析`, not only in the right-side panel.
+
+- [ ] **Step 4: Polish pipeline status indicators**
+
+Add component tests for failed, succeeded, and running pipeline items. Implement red dot for failed, green dot for succeeded, and spinner for running/retrying, with accessible status labels.
+
+- [ ] **Step 5: Verify**
+
+Run:
+
+```bash
+cd webagent-ui && npm test -- --run \
+  src/components/conversation/AgentTurnView.test.tsx \
+  src/components/conversation/AgentActivityTimeline.test.tsx \
+  src/hooks/useWebAgentSession.test.ts \
+  src/lib/clawd/agent-turns.test.ts
+cd webagent-ui && npm run build
+```
+
+Expected: PASS. Vite may print the known chunk-size warning.
+
 ## Self-Review
 
 - Spec coverage: Tasks cover run-level error ownership, conditional auto-scroll, fixed user-question timeline, pipeline process rendering, backend public payload enrichment, and real browser acceptance.
