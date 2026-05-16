@@ -32,6 +32,9 @@ const turn: AgentTurnRecord = {
         hit_count: 1,
         citation_numbers: [1],
       },
+      debug_payload: {
+        raw_tool_result: "INTERNAL_RETRIEVAL_DEBUG_PAYLOAD",
+      },
     },
   ],
   citations: [
@@ -48,7 +51,13 @@ const turn: AgentTurnRecord = {
   expert_results: [],
   artifacts: [],
   error: null,
-  debug_events: [],
+  debug_events: [
+    {
+      event_type: "TOOL_CALL_RESULT",
+      at_ms: new Date("2026-05-15T14:32:08+08:00").getTime(),
+      payload: { raw: "INTERNAL_DEBUG_EVENT_PAYLOAD" },
+    },
+  ],
 };
 
 afterEach(() => {
@@ -63,13 +72,16 @@ describe("AgentTurnView", () => {
     expect(screen.getByText(/主要风险来自运输节点。/)).toBeInTheDocument();
     expect(screen.getByText("资料检索")).toBeInTheDocument();
     expect(screen.getByText("命中 1 篇资料，引用 [1]")).toBeInTheDocument();
+    expect(screen.getByLabelText(/状态：已完成/)).toBeInTheDocument();
     expect(screen.getByText("引用资料")).toBeInTheDocument();
     expect(screen.getByText("供应链报告")).toBeInTheDocument();
     expect(screen.queryByText("TOOL_CALL_RESULT")).not.toBeInTheDocument();
+    expect(screen.queryByText("INTERNAL_RETRIEVAL_DEBUG_PAYLOAD")).not.toBeInTheDocument();
+    expect(screen.queryByText("INTERNAL_DEBUG_EVENT_PAYLOAD")).not.toBeInTheDocument();
   });
 
   it("renders failed turn details and failed generation step inside the answer card", () => {
-    render(
+    const { container } = render(
       <AgentTurnView
         isAdmin={false}
         turn={{
@@ -105,6 +117,8 @@ describe("AgentTurnView", () => {
     expect(screen.getByText("处理失败", { selector: "p" })).toBeInTheDocument();
     expect(screen.getAllByText("模型调用失败，请重试。")).toHaveLength(2);
     expect(screen.getByText("生成回答失败")).toBeInTheDocument();
+    expect(screen.getByLabelText(/状态：失败/)).toBeInTheDocument();
+    expect(container.querySelector("details")).toBeNull();
     expect(screen.queryByText("正在处理")).not.toBeInTheDocument();
   });
 

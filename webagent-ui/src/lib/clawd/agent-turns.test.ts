@@ -65,8 +65,11 @@ describe("agent-turn helpers", () => {
 
     expect(groups[0]?.kind).toBe("retrieval");
     expect(groups[0]?.title).toBe("资料检索");
+    expect(groups[0]?.items[0]?.title).toBe("检索资料库");
+    expect(groups[0]?.items[0]?.action).toBe("查询：台海供应链");
     expect(groups[0]?.items[0]?.output).toContain("命中 2 篇资料");
     expect(groups[0]?.items[0]?.references).toEqual([1, 2]);
+    expect(groups[0]?.items[0]?.detail).toBe("检索完成");
   });
 
   it("adds expert results to the expert pipeline group", () => {

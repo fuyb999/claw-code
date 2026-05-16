@@ -32,8 +32,74 @@ function statusDotClass(status: AgentPipelineItem["status"]): string {
   }
 }
 
+function statusLabel(status: AgentPipelineItem["status"]): string {
+  switch (status) {
+    case "failed":
+      return "失败";
+    case "running":
+      return "进行中";
+    case "retrying":
+      return "重试中";
+    case "skipped":
+      return "已跳过";
+    case "succeeded":
+      return "已完成";
+  }
+}
+
 function formatReferences(references: number[]): string {
   return references.map((reference) => `[${reference}]`).join(" ");
+}
+
+function accessibilityLabelForItem(item: AgentPipelineItem): string {
+  const eventTime = formatEventTime(item.completed_at_ms ?? item.started_at_ms);
+  return eventTime ? `状态：${statusLabel(item.status)}，时间：${eventTime}` : `状态：${statusLabel(item.status)}`;
+}
+
+function extraContentForItem(item: AgentPipelineItem): string[] {
+  return [
+    item.action !== item.title ? item.action : null,
+    item.detail && item.detail !== item.output ? item.detail : null,
+  ].filter((value): value is string => Boolean(value));
+}
+
+function AgentActivitySummary({
+  expandable,
+  item,
+}: {
+  item: AgentPipelineItem;
+  expandable: boolean;
+}) {
+  return (
+    <>
+      <span
+        aria-label={accessibilityLabelForItem(item)}
+        className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(item.status)}`}
+        title={formatEventTime(item.completed_at_ms ?? item.started_at_ms)}
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block break-words text-[11px] font-medium text-foreground/85">
+          {item.title}
+        </span>
+        <span className="mt-0.5 block break-words text-[10px] leading-4 text-muted-foreground">
+          {item.output}
+        </span>
+      </span>
+      {item.references.length ? (
+        <span className="shrink-0 text-[10px] text-primary/80">
+          {formatReferences(item.references)}
+        </span>
+      ) : null}
+      {expandable ? (
+        <span
+          aria-hidden="true"
+          className="mt-0.5 shrink-0 text-[10px] text-muted-foreground transition-transform group-open:rotate-90"
+        >
+          &gt;
+        </span>
+      ) : null}
+    </>
+  );
 }
 
 export function AgentActivityTimeline({
@@ -55,40 +121,35 @@ export function AgentActivityTimeline({
           <section className="min-w-0" key={group.kind}>
             <p className="text-[11px] font-medium text-foreground/85">{group.title}</p>
             <div className="mt-1.5 space-y-1.5">
-              {group.items.map((item) => (
-                <details
-                  className="group rounded-md border border-border/25 bg-card/35 px-2.5 py-2"
-                  key={item.id}
-                >
-                  <summary className="flex min-w-0 cursor-pointer list-none gap-2 [&::-webkit-details-marker]:hidden">
-                    <span
-                      className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(item.status)}`}
-                      title={formatEventTime(item.completed_at_ms ?? item.started_at_ms)}
-                    />
-                    <span className="min-w-0 flex-1">
-                      <span className="block break-words text-[11px] font-medium text-foreground/85">
-                        {item.title}
-                      </span>
-                      <span className="mt-0.5 block break-words text-[10px] leading-4 text-muted-foreground">
-                        {item.output}
-                      </span>
-                    </span>
-                    {item.references.length ? (
-                      <span className="shrink-0 text-[10px] text-primary/80">
-                        {formatReferences(item.references)}
-                      </span>
-                    ) : null}
-                  </summary>
-                  <div className="ml-3.5 mt-1.5 space-y-1 border-l border-border/25 pl-2 text-[10px] leading-4 text-muted-foreground">
-                    {item.action !== item.title ? (
-                      <p className="break-words">{item.action}</p>
-                    ) : null}
-                    {item.detail && item.detail !== item.output ? (
-                      <p className="break-words">{item.detail}</p>
-                    ) : null}
+              {group.items.map((item) => {
+                const extraContent = extraContentForItem(item);
+                const hasExtraContent = extraContent.length > 0;
+
+                return hasExtraContent ? (
+                  <details
+                    className="group rounded-md border border-border/25 bg-card/35 px-2.5 py-2"
+                    key={item.id}
+                  >
+                    <summary className="flex min-w-0 cursor-pointer list-none gap-2 [&::-webkit-details-marker]:hidden">
+                      <AgentActivitySummary expandable item={item} />
+                    </summary>
+                    <div className="ml-3.5 mt-1.5 space-y-1 border-l border-border/25 pl-2 text-[10px] leading-4 text-muted-foreground">
+                      {extraContent.map((content) => (
+                        <p className="break-words" key={content}>
+                          {content}
+                        </p>
+                      ))}
+                    </div>
+                  </details>
+                ) : (
+                  <div
+                    className="flex min-w-0 gap-2 rounded-md border border-border/25 bg-card/35 px-2.5 py-2"
+                    key={item.id}
+                  >
+                    <AgentActivitySummary expandable={false} item={item} />
                   </div>
-                </details>
-              ))}
+                );
+              })}
             </div>
           </section>
         ))}
