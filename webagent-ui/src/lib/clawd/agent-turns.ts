@@ -193,10 +193,10 @@ function pipelineGroupKindForStep(kind: AgentTurnStep["kind"]): AgentPipelineGro
 
 function actionForStep(step: AgentTurnStep): string {
   const payload = payloadRecord(step.public_payload);
-  const query = stringValue(payload.query);
+  const query = stringPayload(payload, "query");
   if (query) return `查询：${query}`;
 
-  const sourceName = stringValue(payload.source_name);
+  const sourceName = stringPayload(payload, "source_name") ?? stringPayload(payload, "sourceName");
   if (sourceName) return `来源：${sourceName}`;
 
   return step.label;
@@ -204,12 +204,12 @@ function actionForStep(step: AgentTurnStep): string {
 
 function outputForStep(step: AgentTurnStep): string {
   const payload = payloadRecord(step.public_payload);
-  const resultSummary = stringValue(payload.result_summary);
+  const resultSummary = stringPayload(payload, "result_summary");
   if (resultSummary) return resultSummary;
 
-  const hitCount = numericValue(payload.hit_count);
+  const hitCount = numberPayload(payload, "hit_count");
   if (hitCount !== null) {
-    const references = citationNumbersFromPayload(step.public_payload);
+    const references = numberListPayload(payload, "citation_numbers");
     const referenceSummary = references.length ? `，引用 ${formatCitationNumbers(references)}` : "";
     return `命中 ${hitCount} 篇资料${referenceSummary}`;
   }
@@ -218,21 +218,33 @@ function outputForStep(step: AgentTurnStep): string {
 }
 
 function citationNumbersFromPayload(payload: unknown): number[] {
-  const value = payloadRecord(payload).citation_numbers;
-  if (!Array.isArray(value)) return [];
-
-  return value.filter((item): item is number => Number.isFinite(item));
+  return numberListPayload(payloadRecord(payload), "citation_numbers");
 }
 
 function formatCitationNumbers(numbers: number[]): string {
   return numbers.map((number) => `[${number}]`).join(" ");
 }
 
-function payloadRecord(payload: unknown): Record<string, unknown> {
+export function payloadRecord(payload: unknown): Record<string, unknown> {
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
     return payload as Record<string, unknown>;
   }
   return {};
+}
+
+export function stringPayload(payload: Record<string, unknown>, key: string): string | null {
+  return stringValue(payload[key]);
+}
+
+export function numberPayload(payload: Record<string, unknown>, key: string): number | null {
+  return numericValue(payload[key]);
+}
+
+export function numberListPayload(payload: Record<string, unknown>, key: string): number[] {
+  const value = payload[key];
+  if (!Array.isArray(value)) return [];
+
+  return value.filter((item): item is number => Number.isFinite(item));
 }
 
 function stringValue(value: unknown): string | null {
