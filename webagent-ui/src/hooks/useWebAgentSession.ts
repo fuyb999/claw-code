@@ -145,6 +145,28 @@ function failTurnWithMessage(
   };
 }
 
+export function mergeRunFinishedTurn({
+  existingTurn,
+  finalTurn,
+  runId,
+}: {
+  existingTurn: AgentTurnRecord;
+  finalTurn: AgentTurnRecord;
+  runId: string;
+}): AgentTurnRecord {
+  const failedStep = existingTurn.steps.find((step) => step.id === `${runId}-failed`);
+  const hasLocalFailure = existingTurn.status === "failed" || Boolean(failedStep) || Boolean(existingTurn.error);
+  if (!hasLocalFailure) {
+    return finalTurn;
+  }
+
+  return {
+    ...finalTurn,
+    steps: failedStep ? mergeById(finalTurn.steps, [failedStep]) : finalTurn.steps,
+    error: existingTurn.error ?? finalTurn.error,
+  };
+}
+
 type ActivityPayload = {
   steps: AgentTurnStep[];
   citations: AgentCitation[];
@@ -421,7 +443,15 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
             const finalTurn = readTurnFromRunFinished(event);
             if (finalTurn) {
               setAgentTurns((current) =>
-                current.map((turn) => (turn.id === runId ? finalTurn : turn)),
+                current.map((turn) =>
+                  turn.id === runId
+                    ? mergeRunFinishedTurn({
+                        existingTurn: turn,
+                        finalTurn,
+                        runId,
+                      })
+                    : turn,
+                ),
               );
               void refreshTurns(conversation.id);
               return;

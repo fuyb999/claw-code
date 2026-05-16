@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentTurnView } from "./AgentTurnView";
 import type { AgentTurnRecord } from "@/lib/clawd/agent-turns";
+import { mergeRunFinishedTurn } from "@/hooks/useWebAgentSession";
 
 const turn: AgentTurnRecord = {
   id: "turn-1",
@@ -96,9 +97,67 @@ describe("AgentTurnView", () => {
     );
 
     expect(screen.getByText("已经生成的部分答案。")).toBeInTheDocument();
-    expect(screen.getAllByText("处理失败")).toHaveLength(2);
+    expect(screen.getByText("处理失败", { selector: "p" })).toBeInTheDocument();
     expect(screen.getAllByText("模型调用失败，请重试。")).toHaveLength(2);
     expect(screen.getByText("生成回答失败")).toBeInTheDocument();
     expect(screen.queryByText("正在处理")).not.toBeInTheDocument();
+  });
+
+  it("preserves local failure details when a final turn arrives after run failure", () => {
+    const failedLocalTurn: AgentTurnRecord = {
+      ...turn,
+      id: "turn-123",
+      assistant_text: "部分回答",
+      status: "failed",
+      steps: [
+        ...turn.steps,
+        {
+          id: "turn-123-failed",
+          kind: "generation",
+          label: "生成回答失败",
+          detail: "模型调用失败，请重试。",
+          status: "failed",
+          started_at_ms: turn.started_at_ms,
+          completed_at_ms: turn.completed_at_ms,
+          public_payload: {
+            result_summary: "模型调用失败，请重试。",
+            is_error: true,
+          },
+        },
+      ],
+      error: {
+        public_message: "模型调用失败，请重试。",
+        debug_message: "provider timeout",
+        code: null,
+      },
+    };
+    const finalTurn: AgentTurnRecord = {
+      ...turn,
+      id: "server-turn-1",
+      assistant_text: "服务端最终回答",
+      status: "failed",
+      steps: [
+        {
+          ...turn.steps[0],
+          id: "server-step-1",
+        },
+      ],
+      error: {
+        public_message: "处理失败",
+        debug_message: "generic failure",
+        code: null,
+      },
+    };
+
+    const merged = mergeRunFinishedTurn({
+      existingTurn: failedLocalTurn,
+      finalTurn,
+      runId: "turn-123",
+    });
+
+    expect(merged.assistant_text).toBe("服务端最终回答");
+    expect(merged.status).toBe("failed");
+    expect(merged.steps.map((step) => step.id)).toContain("turn-123-failed");
+    expect(merged.error).toEqual(failedLocalTurn.error);
   });
 });
