@@ -68,9 +68,11 @@ function extraContentForItem(item: AgentPipelineItem): string[] {
 function AgentActivitySummary({
   expandable,
   item,
+  level,
 }: {
   item: AgentPipelineItem;
   expandable: boolean;
+  level: number;
 }) {
   const isRunning = item.status === "running" || item.status === "retrying";
 
@@ -80,26 +82,36 @@ function AgentActivitySummary({
         <LoaderCircle
           aria-label={accessibilityLabelForItem(item)}
           className={`mt-1 h-3 w-3 shrink-0 animate-spin ${statusDotClass(item.status)}`}
+          data-step-status-indicator="true"
           data-step-status={item.status}
         />
       ) : (
         <span
           aria-label={accessibilityLabelForItem(item)}
           className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(item.status)}`}
+          data-step-status-indicator="true"
           data-step-status={item.status}
           title={formatEventTime(item.completed_at_ms ?? item.started_at_ms)}
         />
       )}
       <span className="min-w-0 flex-1">
-        <span className="block break-words text-[11px] font-medium text-foreground/85">
+        <span
+          className={`block break-words text-[11px] font-medium text-foreground/85 ${
+            level > 0 ? "pl-3" : ""
+          }`}
+        >
           {item.title}
         </span>
-        <span className="mt-0.5 block break-words text-[10px] leading-4 text-muted-foreground">
+        <span
+          className={`mt-0.5 block break-words text-[10px] leading-4 text-muted-foreground ${
+            level > 0 ? "pl-3" : ""
+          }`}
+        >
           {item.output}
         </span>
       </span>
       {item.references.length ? (
-        <span className="shrink-0 text-[10px] text-primary/80">
+        <span className={`shrink-0 text-[10px] text-primary/80 ${level > 0 ? "pl-3" : ""}`}>
           {formatReferences(item.references)}
         </span>
       ) : null}
@@ -112,6 +124,61 @@ function AgentActivitySummary({
         </span>
       ) : null}
     </>
+  );
+}
+
+function AgentActivityItemTree({
+  item,
+  level,
+}: {
+  item: AgentPipelineItem;
+  level: number;
+}) {
+  const extraContent = extraContentForItem(item);
+  const hasExtraContent = extraContent.length > 0;
+
+  return (
+    <div
+      className={`min-w-0 rounded-md border border-border/25 bg-card/35 px-2.5 py-2 ${
+        level > 0 ? "ml-4 border-l-2 border-l-border/40" : ""
+      }`}
+      data-pipeline-item={item.id}
+      data-pipeline-level={level}
+      data-step-status={item.status}
+    >
+      {hasExtraContent ? (
+        <details className="group" open={level === 0}>
+          <summary className="flex min-w-0 cursor-pointer list-none gap-2 [&::-webkit-details-marker]:hidden">
+            <AgentActivitySummary expandable item={item} level={level} />
+          </summary>
+          <div className="ml-3.5 mt-1.5 space-y-1 border-l border-border/25 pl-2 text-[10px] leading-4 text-muted-foreground">
+            {extraContent.map((content) => (
+              <p className="break-words" key={content}>
+                {content}
+              </p>
+            ))}
+            {item.children?.length ? (
+              <div className="mt-2 space-y-1.5">
+                {item.children.map((child) => (
+                  <AgentActivityItemTree item={child} level={level + 1} key={child.id} />
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </details>
+      ) : (
+        <div className="flex min-w-0 gap-2">
+          <AgentActivitySummary expandable={false} item={item} level={level} />
+        </div>
+      )}
+      {!hasExtraContent && item.children?.length ? (
+        <div className="mt-2 space-y-1.5">
+          {item.children.map((child) => (
+            <AgentActivityItemTree item={child} level={level + 1} key={child.id} />
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -134,35 +201,9 @@ export function AgentActivityTimeline({
           <section className="min-w-0" key={group.kind}>
             <p className="text-[11px] font-medium text-foreground/85">{group.title}</p>
             <div className="mt-1.5 space-y-1.5">
-              {group.items.map((item) => {
-                const extraContent = extraContentForItem(item);
-                const hasExtraContent = extraContent.length > 0;
-
-                return hasExtraContent ? (
-                  <details
-                    className="group rounded-md border border-border/25 bg-card/35 px-2.5 py-2"
-                    key={item.id}
-                  >
-                    <summary className="flex min-w-0 cursor-pointer list-none gap-2 [&::-webkit-details-marker]:hidden">
-                      <AgentActivitySummary expandable item={item} />
-                    </summary>
-                    <div className="ml-3.5 mt-1.5 space-y-1 border-l border-border/25 pl-2 text-[10px] leading-4 text-muted-foreground">
-                      {extraContent.map((content) => (
-                        <p className="break-words" key={content}>
-                          {content}
-                        </p>
-                      ))}
-                    </div>
-                  </details>
-                ) : (
-                  <div
-                    className="flex min-w-0 gap-2 rounded-md border border-border/25 bg-card/35 px-2.5 py-2"
-                    key={item.id}
-                  >
-                    <AgentActivitySummary expandable={false} item={item} />
-                  </div>
-                );
-              })}
+              {group.items.map((item) => (
+                <AgentActivityItemTree item={item} key={item.id} level={0} />
+              ))}
             </div>
           </section>
         ))}

@@ -66,6 +66,7 @@ export interface AgentPipelineItem {
   detail: string | null;
   started_at_ms: number | null;
   completed_at_ms: number | null;
+  children?: AgentPipelineItem[];
 }
 
 export interface AgentPipelineGroup {
@@ -83,11 +84,11 @@ const PIPELINE_GROUP_TITLES: Record<AgentPipelineGroupKind, string> = {
 };
 
 const PIPELINE_GROUP_ORDER: AgentPipelineGroupKind[] = [
-  "retrieval",
+  "generation",
   "tool",
+  "retrieval",
   "expert",
   "artifact",
-  "generation",
 ];
 
 export function groupAgentTurnSteps(
@@ -96,10 +97,34 @@ export function groupAgentTurnSteps(
   expertResults: AgentExpertResult[],
 ): AgentPipelineGroup[] {
   const groups = new Map<AgentPipelineGroupKind, AgentPipelineGroup>();
+  const byId = new Map<string, AgentPipelineItem>();
+  let lastToolParentId: string | null = null;
+
+  const attachToParent = (item: AgentPipelineItem, parentId: string | null): void => {
+    const resolvedParentId = parentId && byId.has(parentId) ? parentId : lastToolParentId;
+    if (!resolvedParentId) {
+      addPipelineItem(groups, pipelineGroupKindForItem(item), item);
+      byId.set(item.id, item);
+      if (item.action === "工具调用" || item.title.includes("工具")) {
+        lastToolParentId = item.id;
+      }
+      return;
+    }
+
+    const parent = byId.get(resolvedParentId);
+    if (!parent) {
+      addPipelineItem(groups, pipelineGroupKindForItem(item), item);
+      byId.set(item.id, item);
+      return;
+    }
+
+    parent.children = [...(parent.children ?? []), item];
+    byId.set(item.id, item);
+  };
 
   for (const step of steps) {
     const kind = pipelineGroupKindForStep(step.kind);
-    addPipelineItem(groups, kind, {
+    const item: AgentPipelineItem = {
       id: step.id,
       title: step.label,
       action: actionForStep(step),
@@ -109,11 +134,32 @@ export function groupAgentTurnSteps(
       detail: step.detail,
       started_at_ms: step.started_at_ms,
       completed_at_ms: step.completed_at_ms,
-    });
+    };
+    const payload = payloadRecord(step.public_payload);
+    const parentId = stringPayload(payload, "parent_id") ?? stringPayload(payload, "parentId");
+    if (kind === "tool" && isToolParentItem(item)) {
+      lastToolParentId = item.id;
+      addPipelineItem(groups, kind, item);
+      byId.set(item.id, item);
+      continue;
+    }
+
+    if (kind === "generation" && isTopLevelGenerationItem(item)) {
+      addPipelineItem(groups, kind, item);
+      byId.set(item.id, item);
+      continue;
+    }
+
+    if (parentId || lastToolParentId) {
+      attachToParent(item, parentId);
+    } else {
+      addPipelineItem(groups, kind, item);
+      byId.set(item.id, item);
+    }
   }
 
   expertResults.forEach((result, index) => {
-    addPipelineItem(groups, "expert", {
+    const item: AgentPipelineItem = {
       id: `expert-result-${result.expert_name}-${index}`,
       title: `${result.expert_name} 分析`,
       action: "专家视角分析",
@@ -123,7 +169,15 @@ export function groupAgentTurnSteps(
       detail: null,
       started_at_ms: null,
       completed_at_ms: null,
-    });
+    };
+    if (lastToolParentId && byId.has(lastToolParentId)) {
+      const parent = byId.get(lastToolParentId);
+      if (parent) {
+        parent.children = [...(parent.children ?? []), item];
+        return;
+      }
+    }
+    addPipelineItem(groups, "expert", item);
   });
 
   if (!steps.length && citations.length) {
@@ -173,6 +227,27 @@ function addPipelineItem(
   };
   group.items.push(item);
   groups.set(kind, group);
+}
+
+function isToolParentItem(item: AgentPipelineItem): boolean {
+  return item.title.includes("工具") || item.action.includes("调用") || item.action === "工具调用";
+}
+
+function isTopLevelGenerationItem(item: AgentPipelineItem): boolean {
+  return item.title.includes("模型") || item.title.includes("计划") || item.title.includes("响应");
+}
+
+function pipelineGroupKindForItem(item: AgentPipelineItem): AgentPipelineGroupKind {
+  if (item.title.includes("模型") || item.title.includes("计划") || item.title.includes("响应")) {
+    return "generation";
+  }
+  if (item.action.includes("调用") || item.title.includes("工具")) {
+    return "tool";
+  }
+  if (item.title.includes("专家")) {
+    return "expert";
+  }
+  return "retrieval";
 }
 
 function pipelineGroupKindForStep(kind: AgentTurnStep["kind"]): AgentPipelineGroupKind {
