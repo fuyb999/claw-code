@@ -167,6 +167,38 @@ export function mergeRunFinishedTurn({
   };
 }
 
+function runIdFromFailedStep(turn: AgentTurnRecord): string | null {
+  const failedStep = turn.steps.find((step) => step.id.endsWith("-failed"));
+  return failedStep ? failedStep.id.slice(0, -"-failed".length) : null;
+}
+
+export function mergeRefreshedTurns({
+  currentTurns,
+  refreshedTurns,
+}: {
+  currentTurns: AgentTurnRecord[];
+  refreshedTurns: AgentTurnRecord[];
+}): AgentTurnRecord[] {
+  return refreshedTurns.map((refreshedTurn) => {
+    const existingTurn = currentTurns.find(
+      (turn) =>
+        turn.id === refreshedTurn.id ||
+        runIdFromFailedStep(turn) === refreshedTurn.id ||
+        (turn.conversation_id === refreshedTurn.conversation_id &&
+          turn.user_message === refreshedTurn.user_message),
+    );
+    if (!existingTurn) {
+      return refreshedTurn;
+    }
+
+    return mergeRunFinishedTurn({
+      existingTurn,
+      finalTurn: refreshedTurn,
+      runId: runIdFromFailedStep(existingTurn) ?? existingTurn.id,
+    });
+  });
+}
+
 type ActivityPayload = {
   steps: AgentTurnStep[];
   citations: AgentCitation[];
@@ -266,7 +298,12 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
   const refreshTurns = useCallback(
     async (conversationId: string) => {
       const turns = await listAgentTurns(conversationId, auth);
-      setAgentTurns(turns);
+      setAgentTurns((current) =>
+        mergeRefreshedTurns({
+          currentTurns: current,
+          refreshedTurns: turns,
+        }),
+      );
       return turns;
     },
     [auth],
