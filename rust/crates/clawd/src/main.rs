@@ -16416,8 +16416,7 @@ mod tests {
         assert!(payload
             .get("result_summary")
             .and_then(Value::as_str)
-            .is_some_and(|summary| summary.contains("执行完成"))
-        );
+            .is_some_and(|summary| summary.contains("执行完成")));
     }
 
     #[test]
