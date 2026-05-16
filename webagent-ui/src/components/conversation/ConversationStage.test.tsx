@@ -175,6 +175,42 @@ describe("ConversationStage", () => {
     container.remove();
   });
 
+  it("renders a question timeline rail for agent turns", async () => {
+    const { container, root } = await renderConversation(
+      <ConversationStage
+        agentTurns={[
+          agentTurn({
+            id: "turn-1",
+            user_message: "分析平台资料",
+          }),
+          agentTurn({
+            id: "turn-2",
+            user_message: "补充行业对比",
+            assistant_text: "行业对比结论",
+            started_at_ms: new Date("2026-05-15T10:08:00+08:00").getTime(),
+          }),
+        ]}
+        messages={[]}
+        onSendMessage={() => {}}
+      />,
+    );
+
+    const rail = container.querySelector('[data-agent-timeline-rail="true"]');
+    expect(rail).not.toBeNull();
+
+    const buttons = Array.from(
+      rail?.querySelectorAll<HTMLButtonElement>("button") ?? [],
+    );
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]?.getAttribute("aria-label")).toContain("分析平台资料");
+    expect(buttons[1]?.getAttribute("aria-label")).toContain("补充行业对比");
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
   it("scrolls to the latest content when a new AgentTurn is appended", async () => {
     const scrollTo = vi
       .spyOn(HTMLElement.prototype, "scrollTo")

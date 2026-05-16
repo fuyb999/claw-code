@@ -29,7 +29,11 @@ export function AgentTurnView({
   );
 
   return (
-    <article className="flex w-full min-w-0 gap-3 py-2" data-agent-turn-id={turn.id}>
+    <article
+      className="flex w-full min-w-0 gap-3 py-2"
+      data-agent-turn-id={turn.id}
+      data-agent-turn-question-id={turn.id}
+    >
       <div className="relative flex w-14 shrink-0 justify-end pt-1 text-right">
         <span className="absolute right-[3px] top-0 h-full min-h-8 w-px bg-border/25" />
         <button

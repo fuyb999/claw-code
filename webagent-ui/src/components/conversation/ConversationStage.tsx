@@ -27,6 +27,7 @@ import type { TimelineEvent } from "@/lib/clawd/timeline-events";
 import type { RecentUploadScopeState } from "@/lib/clawd/upload-scope-state";
 
 import { ConversationComposer } from "./ConversationComposer";
+import { AgentTurnTimelineRail } from "./AgentTurnTimelineRail";
 import { AgentTurnView } from "./AgentTurnView";
 import { RuntimeMessageBubble } from "./RuntimeMessageBubble";
 import {
@@ -308,6 +309,22 @@ export function ConversationStage({
     },
     [submitContentNow],
   );
+
+  const jumpToAgentTurn = useCallback((turnId: string) => {
+    const target = viewportRef.current?.querySelector<HTMLElement>(
+      `[data-agent-turn-question-id="${CSS.escape(turnId)}"]`,
+    );
+    if (!target) {
+      return;
+    }
+
+    nearBottomRef.current = false;
+    setShowJumpToBottom(true);
+    target.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
+  }, []);
 
   const handleCopy = useCallback((id: string, content: string) => {
     void navigator.clipboard.writeText(content);
@@ -782,10 +799,14 @@ export function ConversationStage({
             key={threadSnapshot?.id ?? selectedDiscussionId ?? "agent-turns"}
           >
             <div
-              className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-4 scrollbar-thin"
+              className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-4 pl-12 scrollbar-thin md:pl-16"
               data-chat-viewport="true"
               ref={viewportRef}
             >
+              <AgentTurnTimelineRail
+                onJumpToTurn={jumpToAgentTurn}
+                turns={agentTurns}
+              />
               <div className="flex min-h-full flex-col gap-4 pb-2">
                 {groupedAgentTurns.map((group) => (
                   <section className="space-y-2" key={group.key}>
