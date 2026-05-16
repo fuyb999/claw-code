@@ -211,6 +211,60 @@ describe("ConversationStage", () => {
     container.remove();
   });
 
+  it("scrolls to the matching agent turn when clicking a question timeline point", async () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+
+    const { container, root } = await renderConversation(
+      <ConversationStage
+        agentTurns={[
+          agentTurn({
+            id: "turn-1",
+            user_message: "分析平台资料",
+          }),
+          agentTurn({
+            id: "turn-2",
+            user_message: "补充行业对比",
+            assistant_text: "行业对比结论",
+            started_at_ms: new Date("2026-05-15T10:08:00+08:00").getTime(),
+          }),
+        ]}
+        messages={[]}
+        onSendMessage={() => {}}
+      />,
+    );
+
+    const secondTarget = container.querySelector<HTMLElement>(
+      '[data-agent-turn-question-id="turn-2"]',
+    );
+    expect(secondTarget).not.toBeNull();
+
+    const rail = container.querySelector('[data-agent-timeline-rail="true"]');
+    const secondPoint = Array.from(
+      rail?.querySelectorAll<HTMLButtonElement>("button") ?? [],
+    )[1];
+    expect(secondPoint).toBeDefined();
+
+    await act(async () => {
+      secondPoint?.click();
+    });
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.instances[0]).toBe(secondTarget);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
   it("scrolls to the latest content when a new AgentTurn is appended", async () => {
     const scrollTo = vi
       .spyOn(HTMLElement.prototype, "scrollTo")

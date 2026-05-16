@@ -311,9 +311,11 @@ export function ConversationStage({
   );
 
   const jumpToAgentTurn = useCallback((turnId: string) => {
-    const target = viewportRef.current?.querySelector<HTMLElement>(
-      `[data-agent-turn-question-id="${CSS.escape(turnId)}"]`,
-    );
+    const target = Array.from(
+      viewportRef.current?.querySelectorAll<HTMLElement>(
+        "[data-agent-turn-question-id]",
+      ) ?? [],
+    ).find((item) => item.dataset.agentTurnQuestionId === turnId);
     if (!target) {
       return;
     }

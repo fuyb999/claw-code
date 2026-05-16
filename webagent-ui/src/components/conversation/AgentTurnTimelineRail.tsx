@@ -38,12 +38,14 @@ export function AgentTurnTimelineRail({
             return (
               <button
                 aria-label={label}
-                className="h-3 w-3 rounded-full border border-primary/60 bg-background shadow-sm transition-colors hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                className="flex h-6 w-6 items-center justify-center rounded-full transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
                 key={turn.id}
                 onClick={() => onJumpToTurn(turn.id)}
                 title={label}
                 type="button"
-              />
+              >
+                <span className="h-2 w-2 rounded-full border border-primary/60 bg-background shadow-sm" />
+              </button>
             );
           })}
         </div>
