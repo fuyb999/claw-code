@@ -1957,10 +1957,163 @@ git add docs/superpowers/plans/2026-05-15-ag-ui-webagent-rebuild.md docs/web-age
 git commit -m "docs: record ag ui webagent rebuild status"
 ```
 
+### Task 11: Productize Chat Error, Scroll, And Agent Process Hierarchy
+
+**Files:**
+- Modify: `webagent-ui/src/components/conversation/ConversationStage.tsx`
+- Modify: `webagent-ui/src/components/conversation/AgentTurnView.tsx`
+- Modify: `webagent-ui/src/components/conversation/AgentActivityTimeline.tsx`
+- Modify: `webagent-ui/src/hooks/useWebAgentSession.ts`
+- Modify: `webagent-ui/src/lib/clawd/agent-turns.ts`
+- Modify: `rust/crates/clawd/src/main.rs`
+- Modify: `docs/web-agent-prototype-migration-plan.md`
+
+**Goal:** Make the central chat feel like a product-grade WebAgent rather than a log viewer. Errors must belong to the failed turn, new messages must scroll into view, and tool/retrieval/expert output must be grouped under meaningful process steps inside the current answer.
+
+- [ ] **Step 1: Move run errors from page banner into the owning AgentTurn**
+
+Current issue: `ConversationStage` renders `error` at the top of the AgentTurn path, so a run failure can appear above all history.
+
+Implementation:
+
+- Treat `useWebAgentSession.error` as page-level only for loading/auth/list failures.
+- When `sendMessage` catches a run error, update the local turn with:
+  - `status: "failed"`
+  - `error.public_message`
+  - a failed `AgentTurnStep` with user-readable label and detail
+- In `AgentTurnView`, render the failure state inside the assistant answer card:
+  - header status = `处理失败`
+  - compact failure block under the header
+  - retry affordance stays in `ConversationComposer`
+- Remove the AgentTurn path top-of-list `处理异常` banner for per-run failures.
+
+Verification:
+
+```bash
+cd webagent-ui && npm test -- --run src/components/conversation/ConversationStage.test.tsx
+```
+
+Expected:
+
+- A mocked failed AgentTurn renders the error inside its own answer card.
+- The top of the message viewport does not show a global `处理异常` card for run-level failures.
+
+- [ ] **Step 2: Fix auto-scroll on send and streaming updates**
+
+Current issue: sending a new message does not reliably move the viewport to the newest turn.
+
+Implementation:
+
+- Add an explicit scroll dependency key for AgentTurn path:
+  - latest turn id
+  - latest turn status
+  - latest assistant text length
+  - latest steps/citations count
+  - `sending` / `running`
+- On local turn creation, set `nearBottomRef.current = true` and scroll to bottom after render.
+- Follow streaming only while the user is near the bottom.
+- Do not force-scroll when the user has intentionally scrolled upward.
+- Keep the “回到最新内容” control as an absolute/floating button in the viewport bottom-right, above the composer, not as a row in the message flow.
+
+Verification:
+
+```bash
+cd webagent-ui && npm test -- --run src/components/conversation/ConversationStage.test.tsx
+```
+
+Expected:
+
+- `scrollTo` / `scrollIntoView` is called after a new AgentTurn is appended.
+- Streaming text/activity updates keep the bottom pinned only when `nearBottomRef` is true.
+- User scroll-up state suppresses forced auto-scroll and shows the floating return button.
+
+- [ ] **Step 3: Redesign Agent activity as nested product steps**
+
+Current issue: `AgentActivityTimeline` is a flat list of step labels. Tool calls, ES retrieval, expert work, and result summaries are not visually grouped.
+
+Implementation:
+
+- Introduce a frontend view model helper in `agent-turns.ts`, for example `groupAgentTurnSteps(steps, citations, expertResults)`.
+- Group steps into stable categories:
+  - `retrieval`: platform/ES/source search
+  - `tool`: tool execution and result summary
+  - `expert`: expert run state
+  - `artifact`: generated artifacts
+  - `generation`: answer generation
+- Each group renders as one process card with:
+  - status dot
+  - short title
+  - child rows for data source/query/hit count/references/expert summaries
+  - collapsed overflow for verbose details
+- Preserve admin-only raw details in `AgentDebugDetails`; do not show raw JSON in ordinary process rows.
+
+Verification:
+
+```bash
+cd webagent-ui && npm test -- --run src/components/conversation/AgentTurnView.test.tsx src/lib/clawd/agent-turns.test.ts
+```
+
+Expected:
+
+- Retrieval steps render under a single retrieval group.
+- Expert steps render under an expert group.
+- Tool result JSON does not appear in ordinary user-visible text.
+
+- [ ] **Step 4: Make backend step payloads product-ready**
+
+Current issue: backend step payloads are useful but still too tool-shaped. The frontend needs stable fields for grouping and child rows.
+
+Implementation:
+
+- When mapping `EsSearch` results, include in `public_payload`:
+  - `source_name`
+  - `source_id`
+  - `query`
+  - `hit_count`
+  - `citation_numbers`
+  - `empty_result`
+- When mapping generic tools, include:
+  - `tool_purpose`
+  - `result_summary`
+  - `is_error`
+- When mapping experts, include:
+  - `expert_name`
+  - `attempt`
+  - `citation_numbers`
+  - `retry_state`
+- Keep `debug_payload` for raw args/result only.
+
+Verification:
+
+```bash
+cd rust && cargo test -p clawd agent_tool_updates
+cd rust && cargo test -p clawd ag_ui
+```
+
+Expected:
+
+- Public payload contains product fields needed by `AgentActivityTimeline`.
+- Raw tool payloads remain in debug payload only.
+
+- [ ] **Step 5: Real browser acceptance**
+
+Run the current screen setup, then validate in Chrome:
+
+- Send a message with one selected platform source.
+- The new user message and running Agent answer appear immediately and scroll into view.
+- Tool/retrieval progress appears under the current answer, not at the top of the chat.
+- A forced backend/model failure appears inside that answer card, not as a global top banner.
+- Final answer streams in the answer body; citations render as numbered references.
+
+Use these local URLs:
+
+- Backend: `http://127.0.0.1:3210`
+- Frontend: `http://127.0.0.1:4173`
+
 ---
 
 ## Self-Review
 
-- Spec coverage: This plan covers native AG UI endpoint, AgentTurn DB persistence, integrated tool/retrieval/expert rendering, citation replacement, no JSONL migration, no `workspace_root` in the WebAgent route, tool whitelist tightening, queue/interrupt behavior, and final screen-based startup verification.
+- Spec coverage: This plan covers native AG UI endpoint, AgentTurn DB persistence, integrated tool/retrieval/expert rendering, citation replacement, no JSONL migration, no `workspace_root` in the WebAgent route, tool whitelist tightening, queue/interrupt behavior, final screen-based startup verification, and the follow-up productization pass for run-level errors, auto-scroll, and nested process steps.
 - Placeholder scan: The plan contains no `TBD`, `TODO`, or unspecified implementation slots. Each task has concrete files, code shape, commands, and expected outcomes.
 - Type consistency: Backend uses `AgentConversationRecord`, `AgentTurnRecord`, `AgUiEvent`, and store methods consistently. Frontend uses `AgentTurnRecord`, `AgentTurnView`, `AgentActivityTimeline`, `AgentCitationList`, and `AgentDebugDetails` consistently.
