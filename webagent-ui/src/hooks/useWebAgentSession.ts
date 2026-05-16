@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentSubscriber,
   ActivityDeltaEvent,
-  ActivitySnapshotEvent,
   RunFinishedEvent,
   StateSnapshotEvent,
   TextMessageContentEvent,
@@ -145,37 +144,26 @@ function failTurnWithMessage(
   };
 }
 
-type ActivityPayload = {
+function readActivityPayload(event: ActivityDeltaEvent): {
   steps: AgentTurnStep[];
   citations: AgentCitation[];
   expertResults: AgentExpertResult[];
-};
-
-function readActivityContentPayload(content: unknown): ActivityPayload | null {
-  const payload = content as
+} | null {
+  const delta = event.delta as
     | {
         steps?: AgentTurnStep[];
         citations?: AgentCitation[];
         expertResults?: AgentExpertResult[];
       }
-      | undefined;
-  if (!payload) {
+    | undefined;
+  if (!delta) {
     return null;
   }
   return {
-    steps: Array.isArray(payload.steps) ? payload.steps : [],
-    citations: Array.isArray(payload.citations) ? payload.citations : [],
-    expertResults: Array.isArray(payload.expertResults) ? payload.expertResults : [],
+    steps: Array.isArray(delta.steps) ? delta.steps : [],
+    citations: Array.isArray(delta.citations) ? delta.citations : [],
+    expertResults: Array.isArray(delta.expertResults) ? delta.expertResults : [],
   };
-}
-
-function readActivitySnapshotPayload(event: ActivitySnapshotEvent): ActivityPayload | null {
-  return readActivityContentPayload(event.content);
-}
-
-function readActivityDeltaPayload(event: ActivityDeltaEvent): ActivityPayload | null {
-  const rawEvent = event.rawEvent as { delta?: unknown } | undefined;
-  return readActivityContentPayload(rawEvent?.delta);
 }
 
 function readTurnFromRunFinished(event: RunFinishedEvent): AgentTurnRecord | null {
@@ -362,29 +350,8 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
               status: "running",
             }));
           },
-          onActivitySnapshotEvent: ({ event }: { event: ActivitySnapshotEvent }) => {
-            const payload = readActivitySnapshotPayload(event);
-            if (!payload) {
-              return;
-            }
-            updateTurn((turn) => ({
-              ...turn,
-              steps: mergeById(turn.steps, payload.steps),
-              citations: mergeById(turn.citations, payload.citations),
-              expert_results: mergeById(
-                turn.expert_results.map((expert) => ({
-                  ...expert,
-                  id: expert.expert_name,
-                })),
-                payload.expertResults.map((expert) => ({
-                  ...expert,
-                  id: expert.expert_name,
-                })),
-              ).map(({ id: _id, ...expert }) => expert),
-            }));
-          },
           onActivityDeltaEvent: ({ event }: { event: ActivityDeltaEvent }) => {
-            const payload = readActivityDeltaPayload(event);
+            const payload = readActivityPayload(event);
             if (!payload) {
               return;
             }

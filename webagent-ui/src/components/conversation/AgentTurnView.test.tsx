@@ -68,7 +68,7 @@ describe("AgentTurnView", () => {
         isAdmin={false}
         turn={{
           ...turn,
-          assistant_text: "",
+          assistant_text: "已经生成的部分答案。",
           status: "failed",
           steps: [
             {
@@ -95,6 +95,7 @@ describe("AgentTurnView", () => {
       />,
     );
 
+    expect(screen.getByText("已经生成的部分答案。")).toBeInTheDocument();
     expect(screen.getAllByText("处理失败")).toHaveLength(2);
     expect(screen.getAllByText("模型调用失败，请重试。")).toHaveLength(2);
     expect(screen.getByText("生成回答失败")).toBeInTheDocument();
