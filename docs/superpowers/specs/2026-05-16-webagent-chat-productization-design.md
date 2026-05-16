@@ -132,6 +132,7 @@ Follow-up UI constraints confirmed on 2026-05-16:
 - Assistant replies use long-content folding. Short replies stay fully visible; long replies default to a preview of about 10 lines with `展开全文` / `收起`.
 - Selecting experts before asking a question must be reflected in the current answer pipeline. Expert execution cannot only appear in the right panel.
 - Every pipeline item shows an end-state indicator: green for succeeded, red for failed, and a spinner for running/retrying. Status must also be available as text for accessibility.
+- Pipeline steps render as a parent-child execution chain, not a flat list. The normal order is model response / plan, then tool call, then tool-owned child steps such as retrieval tokenization, retrieval, and result. Retrieval/expert/result details must attach under their owning parent instead of appearing as unrelated rows after the answer.
 
 Admin-only details stay in `AgentDebugDetails`:
 

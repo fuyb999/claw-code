@@ -1379,6 +1379,38 @@ cd webagent-ui && npm run build
 
 Expected: PASS. Vite may print the known chunk-size warning.
 
+### Task 8: Tree-Shaped Agent Execution Pipeline
+
+**Files:**
+- Modify: `webagent-ui/src/lib/clawd/agent-turns.ts`
+- Modify: `webagent-ui/src/lib/clawd/agent-turns.test.ts`
+- Modify: `webagent-ui/src/components/conversation/AgentActivityTimeline.tsx`
+- Modify: `webagent-ui/src/components/conversation/AgentActivityTimeline.test.tsx`
+
+- [ ] **Step 1: Add a tree grouping test**
+
+Build steps for `模型接口响应内容 -> 计划 -> 工具调用 -> 检索分词 -> 检索 -> 结果`. Assert that `groupAgentTurnSteps` returns top-level model/plan items first, with tool/retrieval/result rows nested as children rather than appearing as separate top-level rows.
+
+- [ ] **Step 2: Add child item support**
+
+Add `children?: AgentPipelineItem[]` and optional `parent_id` / `phase` interpretation from `public_payload`. If explicit parent IDs are unavailable, use conservative heuristics: generation/plan items are top-level, tool items are parents, and retrieval/citation/result-like steps after a tool attach to the most recent tool parent.
+
+- [ ] **Step 3: Render tree UI**
+
+Render nested child items with indentation and connector borders. Child rows keep their own status indicator and summaries. Do not duplicate the assistant answer text inside a tool row.
+
+- [ ] **Step 4: Verify**
+
+Run:
+
+```bash
+cd webagent-ui && npm test -- --run \
+  src/lib/clawd/agent-turns.test.ts \
+  src/components/conversation/AgentActivityTimeline.test.tsx
+```
+
+Expected: PASS.
+
 ## Self-Review
 
 - Spec coverage: Tasks cover run-level error ownership, conditional auto-scroll, fixed user-question timeline, pipeline process rendering, backend public payload enrichment, and real browser acceptance.
