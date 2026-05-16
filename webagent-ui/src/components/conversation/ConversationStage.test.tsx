@@ -175,6 +175,117 @@ describe("ConversationStage", () => {
     container.remove();
   });
 
+  it("scrolls to the latest content when a new AgentTurn is appended", async () => {
+    const scrollTo = vi
+      .spyOn(HTMLElement.prototype, "scrollTo")
+      .mockImplementation(() => {});
+    const firstTurn = agentTurn({ id: "turn-1", user_message: "第一轮问题" });
+    const secondTurn = agentTurn({
+      id: "turn-2",
+      user_message: "第二轮问题",
+      assistant_text: "第二轮结论",
+    });
+
+    const { container, root } = await renderConversation(
+      <ConversationStage
+        agentTurns={[firstTurn]}
+        messages={[]}
+        onSendMessage={() => {}}
+      />,
+    );
+
+    const viewport = container.querySelector<HTMLElement>('[data-chat-viewport="true"]');
+    expect(viewport).not.toBeNull();
+    if (viewport) {
+      Object.defineProperty(viewport, "scrollHeight", {
+        configurable: true,
+        value: 1600,
+      });
+    }
+    scrollTo.mockClear();
+
+    await act(async () => {
+      root.render(
+        <ConversationStage
+          agentTurns={[firstTurn, secondTurn]}
+          messages={[]}
+          onSendMessage={() => {}}
+        />,
+      );
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    expect(scrollTo).toHaveBeenCalledWith({
+      top: expect.any(Number),
+      behavior: "smooth",
+    });
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+    scrollTo.mockRestore();
+  });
+
+  it("does not force-scroll streaming AgentTurn updates after the user scrolls up", async () => {
+    const scrollTo = vi
+      .spyOn(HTMLElement.prototype, "scrollTo")
+      .mockImplementation(() => {});
+    const initialTurn = agentTurn({
+      id: "turn-1",
+      status: "running",
+      assistant_text: "正在生成初始内容。",
+    });
+
+    const { container, root } = await renderConversation(
+      <ConversationStage
+        agentTurns={[initialTurn]}
+        messages={[]}
+        onSendMessage={() => {}}
+      />,
+    );
+
+    const viewport = container.querySelector<HTMLElement>('[data-chat-viewport="true"]');
+    expect(viewport).not.toBeNull();
+    if (viewport) {
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 2000 },
+        clientHeight: { configurable: true, value: 600 },
+        scrollTop: { configurable: true, value: 200, writable: true },
+      });
+      await act(async () => {
+        viewport.dispatchEvent(new Event("scroll", { bubbles: true }));
+      });
+    }
+    scrollTo.mockClear();
+
+    await act(async () => {
+      root.render(
+        <ConversationStage
+          agentTurns={[
+            agentTurn({
+              id: "turn-1",
+              status: "running",
+              assistant_text: "正在生成初始内容。这里追加了更长的流式回复内容。",
+            }),
+          ]}
+          messages={[]}
+          onSendMessage={() => {}}
+        />,
+      );
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    expect(scrollTo).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("回到最新内容");
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+    scrollTo.mockRestore();
+  });
+
   it("keeps the composer editable and queues follow-up messages while an agent turn is running", async () => {
     const onInterrupt = vi.fn();
     const onSendMessage = vi.fn();

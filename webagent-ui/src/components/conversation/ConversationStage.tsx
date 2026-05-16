@@ -434,10 +434,13 @@ export function ConversationStage({
     () => groupTurnsByDisplayDate(agentTurns),
     [agentTurns],
   );
+  const latestAgentTurn = agentTurns[agentTurns.length - 1] ?? null;
+  const latestAgentTurnId = latestAgentTurn?.id ?? null;
+  const agentTurnStreamKey = latestAgentTurn
+    ? `${latestAgentTurn.id}:${latestAgentTurn.status}:${latestAgentTurn.assistant_text.length}:${latestAgentTurn.steps.length}:${latestAgentTurn.citations.length}`
+    : "";
   const viewportDependencyKey = hasAgentTurnPath
-    ? agentTurns
-        .map((turn) => `${turn.id}:${turn.status}:${turn.assistant_text.length}:${turn.steps.length}:${turn.citations.length}`)
-        .join("|")
+    ? agentTurnStreamKey
     : runtimeMessages.length;
 
   const MessageBubble = useMemo(
@@ -474,6 +477,21 @@ export function ConversationStage({
     viewport.addEventListener("scroll", updateScrollState, { passive: true });
     return () => viewport.removeEventListener("scroll", updateScrollState);
   }, [viewportDependencyKey, threadSnapshot?.id]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!hasAgentTurnPath || !viewport) {
+      return;
+    }
+
+    nearBottomRef.current = true;
+    setShowJumpToBottom(false);
+    const frameId = window.requestAnimationFrame(() => {
+      scrollElementToBottom(viewport);
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [hasAgentTurnPath, latestAgentTurnId]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -765,6 +783,7 @@ export function ConversationStage({
           >
             <div
               className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-4 scrollbar-thin"
+              data-chat-viewport="true"
               ref={viewportRef}
             >
               <div className="flex min-h-full flex-col gap-4 pb-2">
@@ -823,6 +842,7 @@ export function ConversationStage({
         >
           <ThreadPrimitive.Viewport
             className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-4 scrollbar-thin"
+            data-chat-viewport="true"
             ref={viewportRef}
           >
             <div className="flex min-h-full flex-col gap-4 pb-2">
