@@ -6457,6 +6457,8 @@ fn map_tool_result_to_agent_updates(
     let now = now_millis();
     let parsed = serde_json::from_str::<Value>(output).unwrap_or(Value::String(output.to_string()));
     let citations = extract_agent_citations(tool_call_id, tool_name, &parsed);
+    let public_payload =
+        build_step_public_payload(tool_name, input, &parsed, &citations, is_error);
     let public_label = match tool_name {
         "EsSearch" | "SourceSearch" => {
             if is_error {
@@ -6510,7 +6512,7 @@ fn map_tool_result_to_agent_updates(
             },
             started_at_ms: None,
             completed_at_ms: Some(now),
-            public_payload: json!({ "citation_count": citations.len() }),
+            public_payload,
             debug_payload: Some(json!({ "tool": tool_name, "input": input, "output": output })),
         }],
         citations,
@@ -6584,6 +6586,107 @@ fn value_string(value: &Value, keys: &[&str]) -> Option<String> {
             .map(str::trim)
             .filter(|item| !item.is_empty())
             .map(ToString::to_string)
+    })
+}
+
+fn value_usize(value: &Value, keys: &[&str]) -> Option<usize> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(value_as_usize)
+}
+
+fn value_as_usize(value: &Value) -> Option<usize> {
+    if let Some(number) = value.as_u64() {
+        return usize::try_from(number).ok();
+    }
+    if let Some(number) = value.as_i64() {
+        return usize::try_from(number).ok();
+    }
+    if let Some(text) = value.as_str() {
+        return text.trim().parse::<usize>().ok();
+    }
+    if let Some(nested) = value.get("value") {
+        return value_as_usize(nested);
+    }
+    None
+}
+
+fn extract_query_from_tool_input(input: &str) -> Option<String> {
+    serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|value| value_string(&value, &["query", "q", "keyword", "keywords"]))
+}
+
+fn summarize_tool_output(output: &Value, is_error: bool) -> String {
+    if is_error {
+        return match output.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+            Some(message) => format!("执行失败：{message}"),
+            None => "执行失败".to_string(),
+        };
+    }
+
+    if let Some(count) = output.get("hits").and_then(Value::as_array).map(Vec::len) {
+        if count == 0 {
+            return "执行完成，未返回结果".to_string();
+        }
+        return format!("执行完成，返回 {count} 条结果");
+    }
+
+    if let Some(count) = output.get("rows").and_then(Value::as_array).map(Vec::len) {
+        if count == 0 {
+            return "执行完成，未返回数据行".to_string();
+        }
+        return format!("执行完成，返回 {count} 行数据");
+    }
+
+    "执行完成".to_string()
+}
+
+fn build_step_public_payload(
+    tool_name: &str,
+    input: &str,
+    parsed_output: &Value,
+    citations: &[AgentCitation],
+    is_error: bool,
+) -> Value {
+    if matches!(tool_name, "EsSearch" | "SourceSearch") {
+        let source_name = value_string(parsed_output, &["data_source_name", "source_name", "index"])
+            .unwrap_or_else(|| "平台资料库".to_string());
+        let query = value_string(parsed_output, &["query", "q", "keyword", "keywords"])
+            .or_else(|| extract_query_from_tool_input(input));
+        let hit_count = value_usize(parsed_output, &["hit_count", "count", "total"])
+            .or_else(|| parsed_output.get("hits").and_then(Value::as_array).map(Vec::len))
+            .unwrap_or(citations.len());
+        let citation_numbers = citations
+            .iter()
+            .map(|citation| citation.number)
+            .collect::<Vec<_>>();
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("source_name".to_string(), json!(source_name));
+        if let Some(source_id) =
+            value_string(parsed_output, &["data_source_id", "source_id", "sourceId"])
+        {
+            payload.insert("source_id".to_string(), json!(source_id));
+        }
+        if let Some(query) = query {
+            payload.insert("query".to_string(), json!(query));
+        }
+        payload.insert("hit_count".to_string(), json!(hit_count));
+        payload.insert("citation_numbers".to_string(), json!(citation_numbers));
+        payload.insert("empty_result".to_string(), json!(hit_count == 0));
+        payload.insert("is_error".to_string(), json!(is_error));
+        payload.insert(
+            "result_summary".to_string(),
+            json!(summarize_tool_output(parsed_output, is_error)),
+        );
+        return Value::Object(payload);
+    }
+
+    json!({
+        "tool_purpose": tool_name,
+        "result_summary": summarize_tool_output(parsed_output, is_error),
+        "is_error": is_error,
     })
 }
 
@@ -16215,6 +16318,87 @@ mod tests {
             Some("uploads/supply-chain.pdf")
         );
         assert_eq!(mapped.citations[0].preview, "港口风险上升");
+    }
+
+    #[test]
+    fn es_search_updates_include_product_payload_fields() {
+        let output = serde_json::json!({
+            "data_source_name": "Sina Elasticsearch",
+            "index": "sina-news",
+            "query": "供应链风险",
+            "hits": [
+                {
+                    "title": "供应链风险跟踪",
+                    "preview": "企业供应链受到外部冲击",
+                    "location": "sina-news#1"
+                },
+                {
+                    "title": "港口物流观察",
+                    "preview": "港口拥堵抬升交付风险",
+                    "location": "sina-news#2"
+                }
+            ]
+        })
+        .to_string();
+
+        let mapped = map_tool_result_to_agent_updates(
+            "tool-es",
+            "EsSearch",
+            r#"{"query":"供应链风险"}"#,
+            &output,
+            false,
+        );
+
+        let payload = mapped.steps[0]
+            .public_payload
+            .as_object()
+            .expect("public payload object");
+        assert_eq!(
+            payload.get("source_name").and_then(Value::as_str),
+            Some("Sina Elasticsearch")
+        );
+        assert_eq!(
+            payload.get("query").and_then(Value::as_str),
+            Some("供应链风险")
+        );
+        assert_eq!(payload.get("hit_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            payload.get("citation_numbers").and_then(Value::as_array),
+            Some(&vec![json!(1), json!(2)])
+        );
+        assert_eq!(
+            payload.get("empty_result").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn generic_tool_updates_include_product_summary_payload() {
+        let output = serde_json::json!({
+            "rows": [
+                { "name": "A", "risk": "high" },
+                { "name": "B", "risk": "medium" }
+            ]
+        })
+        .to_string();
+
+        let mapped = map_tool_result_to_agent_updates("tool-db", "DbQuery", "{}", &output, false);
+
+        let payload = mapped.steps[0]
+            .public_payload
+            .as_object()
+            .expect("public payload object");
+        assert_eq!(
+            payload.get("tool_purpose").and_then(Value::as_str),
+            Some("DbQuery")
+        );
+        assert_eq!(payload.get("is_error").and_then(Value::as_bool), Some(false));
+        assert!(
+            payload
+                .get("result_summary")
+                .and_then(Value::as_str)
+                .is_some_and(|summary| summary.contains("执行完成"))
+        );
     }
 
     #[test]
