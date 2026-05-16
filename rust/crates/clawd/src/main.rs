@@ -6457,8 +6457,7 @@ fn map_tool_result_to_agent_updates(
     let now = now_millis();
     let parsed = serde_json::from_str::<Value>(output).unwrap_or(Value::String(output.to_string()));
     let citations = extract_agent_citations(tool_call_id, tool_name, &parsed);
-    let public_payload =
-        build_step_public_payload(tool_name, input, &parsed, &citations, is_error);
+    let public_payload = build_step_public_payload(tool_name, input, &parsed, &citations, is_error);
     let public_label = match tool_name {
         "EsSearch" | "SourceSearch" => {
             if is_error {
@@ -6619,7 +6618,11 @@ fn extract_query_from_tool_input(input: &str) -> Option<String> {
 
 fn summarize_tool_output(output: &Value, is_error: bool) -> String {
     if is_error {
-        return match output.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+        return match output
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
             Some(message) => format!("执行失败：{message}"),
             None => "执行失败".to_string(),
         };
@@ -6650,12 +6653,18 @@ fn build_step_public_payload(
     is_error: bool,
 ) -> Value {
     if matches!(tool_name, "EsSearch" | "SourceSearch") {
-        let source_name = value_string(parsed_output, &["data_source_name", "source_name", "index"])
-            .unwrap_or_else(|| "平台资料库".to_string());
+        let source_name =
+            value_string(parsed_output, &["data_source_name", "source_name", "index"])
+                .unwrap_or_else(|| "平台资料库".to_string());
         let query = value_string(parsed_output, &["query", "q", "keyword", "keywords"])
             .or_else(|| extract_query_from_tool_input(input));
         let hit_count = value_usize(parsed_output, &["hit_count", "count", "total"])
-            .or_else(|| parsed_output.get("hits").and_then(Value::as_array).map(Vec::len))
+            .or_else(|| {
+                parsed_output
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            })
             .unwrap_or(citations.len());
         let citation_numbers = citations
             .iter()
@@ -16400,12 +16409,14 @@ mod tests {
             payload.get("tool_purpose").and_then(Value::as_str),
             Some("DbQuery")
         );
-        assert_eq!(payload.get("is_error").and_then(Value::as_bool), Some(false));
-        assert!(
-            payload
-                .get("result_summary")
-                .and_then(Value::as_str)
-                .is_some_and(|summary| summary.contains("执行完成"))
+        assert_eq!(
+            payload.get("is_error").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(payload
+            .get("result_summary")
+            .and_then(Value::as_str)
+            .is_some_and(|summary| summary.contains("执行完成"))
         );
     }
 
