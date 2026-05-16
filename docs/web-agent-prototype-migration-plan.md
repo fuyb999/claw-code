@@ -6,6 +6,10 @@
 
 本轮重新确认后，中央聊天区不能继续停留在“旧 thread snapshot / SSE 适配成 assistant-ui 消息”的形态。当前工具调用、检索结果、专家过程和最终答案仍容易被拆成不同气泡，本质原因是前端仍在旧消息块上做兼容合并，而不是让 Agent Run 生命周期成为一等模型。
 
+实施状态：已完成 AG UI 原生端点、AgentTurn 数据库存储、前端 AgentTurnView 主渲染、WebAgent 工具白名单和 `workspace_root` 主链路移除。当前验收地址按运行环境约束使用 screen 启动，运行库固定为 `.clawd-dev/clawd.db`。
+
+验证状态：`cargo fmt`、`cargo test --workspace`、`npm test -- --run`、`npm run build` 已通过；`cargo clippy --workspace --all-targets -- -D warnings` 当前仍被仓库级既有 lint 债阻塞，范围在 `runtime`、`commands`、`api`，不属于本轮 AG UI WebAgent 主线改造。
+
 后续 AG UI 改造采用以下硬边界：
 
 1. **后端直接实现原生 AG UI 协议端点。**
