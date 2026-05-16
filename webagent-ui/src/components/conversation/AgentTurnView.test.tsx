@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentTurnView } from "./AgentTurnView";
@@ -66,9 +66,10 @@ afterEach(() => {
 
 describe("AgentTurnView", () => {
   it("renders one user question with one integrated agent answer", () => {
-    render(<AgentTurnView isAdmin={false} turn={turn} />);
+    const { container } = render(<AgentTurnView isAdmin={false} turn={turn} />);
 
     expect(screen.getByText("分析台海供应链风险")).toBeInTheDocument();
+    expect(container.querySelector('[data-user-question-bubble="true"]')).toHaveClass("w-fit");
     expect(screen.getByText(/主要风险来自运输节点。/)).toBeInTheDocument();
     expect(screen.getByText("资料检索")).toBeInTheDocument();
     expect(screen.getByText("命中 1 篇资料，引用 [1]")).toBeInTheDocument();
@@ -78,6 +79,32 @@ describe("AgentTurnView", () => {
     expect(screen.queryByText("TOOL_CALL_RESULT")).not.toBeInTheDocument();
     expect(screen.queryByText("INTERNAL_RETRIEVAL_DEBUG_PAYLOAD")).not.toBeInTheDocument();
     expect(screen.queryByText("INTERNAL_DEBUG_EVENT_PAYLOAD")).not.toBeInTheDocument();
+  });
+
+  it("collapses long assistant answers by default and can expand them", () => {
+    const longAnswer = Array.from(
+      { length: 14 },
+      (_, index) => `第 ${index + 1} 行：这是一个较长的分析段落。`,
+    ).join("\n");
+
+    render(
+      <AgentTurnView
+        isAdmin={false}
+        turn={{
+          ...turn,
+          assistant_text: longAnswer,
+          steps: [],
+          citations: [],
+        }}
+      />,
+    );
+
+    const answer = screen.getByTestId("assistant-answer-content");
+    expect(answer).toHaveAttribute("data-collapsed", "true");
+    const expandButton = screen.getByRole("button", { name: "展开全文" });
+    fireEvent.click(expandButton);
+    expect(answer).toHaveAttribute("data-collapsed", "false");
+    expect(screen.getByRole("button", { name: "收起" })).toBeInTheDocument();
   });
 
   it("renders failed turn details and failed generation step inside the answer card", () => {

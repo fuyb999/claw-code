@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { AgentTurnRecord } from "@/lib/clawd/agent-turns";
 
-import { mergeRunFinishedTurn, mergeRefreshedTurns } from "./useWebAgentSession";
+import {
+  createLocalRunningTurnForTest,
+  mergeRunFinishedTurn,
+  mergeRefreshedTurns,
+} from "./useWebAgentSession";
 
 const baseTurn: AgentTurnRecord = {
   id: "turn-123",
@@ -62,6 +66,32 @@ function failedLocalTurn(runId = "turn-123"): AgentTurnRecord {
 }
 
 describe("useWebAgentSession failure turn merging", () => {
+  it("creates local expert pipeline placeholders for selected experts", () => {
+    const localTurn = createLocalRunningTurnForTest({
+      conversation: {
+        id: "conv-1",
+        tenant_id: "tenant-a",
+        owner_id: "alice",
+        title: "专家会诊",
+        status: "running",
+        selected_knowledge_base_ids: [],
+        selected_data_source_ids: [],
+        selected_expert_ids: ["Howard Wang", "Lin Yifu"],
+        model_profile_id: null,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+      },
+      content: "分析中美经济",
+      runId: "turn-expert",
+      selectedExpertIds: ["Howard Wang", "Lin Yifu"],
+    });
+
+    expect(localTurn.steps.map((step) => step.kind)).toContain("expert");
+    expect(localTurn.steps.map((step) => step.label)).toEqual(
+      expect.arrayContaining(["Howard Wang 分析中", "Lin Yifu 分析中"]),
+    );
+  });
+
   it("preserves local failure details when a final turn arrives after run failure", () => {
     const localTurn = failedLocalTurn();
     const finalTurn: AgentTurnRecord = {

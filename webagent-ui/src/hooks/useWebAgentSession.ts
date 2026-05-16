@@ -44,12 +44,15 @@ function createLocalRunningTurn({
   conversation,
   content,
   runId,
+  selectedExpertIds = [],
 }: {
   conversation: AgentConversationRecord;
   content: string;
   runId: string;
+  selectedExpertIds?: string[];
 }): AgentTurnRecord {
   const now = Date.now();
+  const expertIds = normalizeStringList(selectedExpertIds);
   return {
     id: runId,
     conversation_id: conversation.id,
@@ -71,6 +74,19 @@ function createLocalRunningTurn({
         completed_at_ms: null,
         public_payload: {},
       },
+      ...expertIds.map((expertId) => ({
+        id: `${runId}-expert-${expertId}`,
+        kind: "expert" as const,
+        label: `${expertId} 分析中`,
+        detail: "等待专家返回分析结果",
+        status: "running" as const,
+        started_at_ms: now,
+        completed_at_ms: null,
+        public_payload: {
+          expert_name: expertId,
+          result_summary: "专家分析进行中",
+        },
+      })),
     ],
     citations: [],
     expert_results: [],
@@ -79,6 +95,8 @@ function createLocalRunningTurn({
     debug_events: [],
   };
 }
+
+export const createLocalRunningTurnForTest = createLocalRunningTurn;
 
 function mergeById<T extends { id: string }>(current: T[], incoming: T[]): T[] {
   const next = [...current];
@@ -391,6 +409,7 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
           conversation,
           content: trimmed,
           runId,
+          selectedExpertIds: options.selectedExpertIds,
         });
         setAgentTurns((current) => [...current, localTurn]);
 

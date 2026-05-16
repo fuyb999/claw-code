@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import type { AgentTurnRecord } from "@/lib/clawd/agent-turns";
 import {
   replaceEvidenceMarkersWithCitationNumbers,
@@ -16,6 +18,14 @@ function formatTurnTime(value: number): string {
   });
 }
 
+const COLLAPSE_LINE_THRESHOLD = 10;
+const COLLAPSE_CHAR_THRESHOLD = 900;
+
+function shouldCollapseAssistantText(value: string): boolean {
+  const lineCount = value.split(/\r?\n/).length;
+  return lineCount > COLLAPSE_LINE_THRESHOLD || value.length > COLLAPSE_CHAR_THRESHOLD;
+}
+
 export function AgentTurnView({
   isAdmin,
   turn,
@@ -27,6 +37,9 @@ export function AgentTurnView({
     turn.assistant_text,
     turn.citations,
   );
+  const canCollapseAnswer = shouldCollapseAssistantText(assistantText);
+  const [answerExpanded, setAnswerExpanded] = useState(!canCollapseAnswer);
+  const answerCollapsed = canCollapseAnswer && !answerExpanded;
 
   return (
     <article
@@ -49,7 +62,10 @@ export function AgentTurnView({
       </div>
 
       <div className="min-w-0 flex-1 space-y-3">
-        <div className="ml-auto max-w-[72%] rounded-2xl rounded-tr-sm border border-primary/20 bg-primary/15 px-4 py-3">
+        <div
+          className="ml-auto w-fit max-w-[72%] rounded-2xl rounded-tr-sm border border-primary/20 bg-primary/15 px-4 py-3"
+          data-user-question-bubble="true"
+        >
           <p className="whitespace-pre-wrap break-words text-sm leading-6 text-foreground [overflow-wrap:anywhere]">
             {turn.user_message}
           </p>
@@ -64,7 +80,24 @@ export function AgentTurnView({
           </div>
 
           {assistantText.trim() ? (
-            <MarkdownMessage content={assistantText} streaming={turn.status === "running"} />
+            <div>
+              <div
+                className={answerCollapsed ? "max-h-72 overflow-hidden" : ""}
+                data-collapsed={answerCollapsed ? "true" : "false"}
+                data-testid="assistant-answer-content"
+              >
+                <MarkdownMessage content={assistantText} streaming={turn.status === "running"} />
+              </div>
+              {canCollapseAnswer ? (
+                <button
+                  className="mt-2 text-[11px] font-medium text-primary hover:text-primary/80"
+                  onClick={() => setAnswerExpanded((current) => !current)}
+                  type="button"
+                >
+                  {answerExpanded ? "收起" : "展开全文"}
+                </button>
+              ) : null}
+            </div>
           ) : turn.status === "failed" ? null : (
             <p className="text-sm leading-6 text-muted-foreground">正在处理</p>
           )}

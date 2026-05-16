@@ -1,3 +1,5 @@
+import { LoaderCircle } from "lucide-react";
+
 import type {
   AgentCitation,
   AgentExpertResult,
@@ -24,7 +26,7 @@ function statusDotClass(status: AgentPipelineItem["status"]): string {
       return "bg-destructive";
     case "running":
     case "retrying":
-      return "bg-primary";
+      return "text-primary";
     case "skipped":
       return "bg-muted-foreground/45";
     case "succeeded":
@@ -70,13 +72,24 @@ function AgentActivitySummary({
   item: AgentPipelineItem;
   expandable: boolean;
 }) {
+  const isRunning = item.status === "running" || item.status === "retrying";
+
   return (
     <>
-      <span
-        aria-label={accessibilityLabelForItem(item)}
-        className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(item.status)}`}
-        title={formatEventTime(item.completed_at_ms ?? item.started_at_ms)}
-      />
+      {isRunning ? (
+        <LoaderCircle
+          aria-label={accessibilityLabelForItem(item)}
+          className={`mt-1 h-3 w-3 shrink-0 animate-spin ${statusDotClass(item.status)}`}
+          data-step-status={item.status}
+        />
+      ) : (
+        <span
+          aria-label={accessibilityLabelForItem(item)}
+          className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(item.status)}`}
+          data-step-status={item.status}
+          title={formatEventTime(item.completed_at_ms ?? item.started_at_ms)}
+        />
+      )}
       <span className="min-w-0 flex-1">
         <span className="block break-words text-[11px] font-medium text-foreground/85">
           {item.title}
