@@ -6678,7 +6678,11 @@ fn build_step_public_payload(
         payload.insert("is_error".to_string(), json!(is_error));
         payload.insert(
             "result_summary".to_string(),
-            json!(summarize_tool_output(parsed_output, is_error)),
+            json!(if is_error {
+                summarize_tool_output(parsed_output, true)
+            } else {
+                format!("命中 {hit_count} 篇资料，形成 {} 条引用", citations.len())
+            }),
         );
         return Value::Object(payload);
     }
@@ -16369,6 +16373,10 @@ mod tests {
         assert_eq!(
             payload.get("empty_result").and_then(Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            payload.get("result_summary").and_then(Value::as_str),
+            Some("命中 2 篇资料，形成 2 条引用")
         );
     }
 
