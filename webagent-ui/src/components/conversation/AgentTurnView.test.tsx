@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentTurnView } from "./AgentTurnView";
 import type { AgentTurnRecord } from "@/lib/clawd/agent-turns";
@@ -46,6 +46,10 @@ const turn: AgentTurnRecord = {
   debug_events: [],
 };
 
+afterEach(() => {
+  cleanup();
+});
+
 describe("AgentTurnView", () => {
   it("renders one user question with one integrated agent answer", () => {
     render(<AgentTurnView isAdmin={false} turn={turn} />);
@@ -56,5 +60,44 @@ describe("AgentTurnView", () => {
     expect(screen.getByText("引用资料")).toBeInTheDocument();
     expect(screen.getByText("供应链报告")).toBeInTheDocument();
     expect(screen.queryByText("TOOL_CALL_RESULT")).not.toBeInTheDocument();
+  });
+
+  it("renders failed turn details and failed generation step inside the answer card", () => {
+    render(
+      <AgentTurnView
+        isAdmin={false}
+        turn={{
+          ...turn,
+          assistant_text: "",
+          status: "failed",
+          steps: [
+            {
+              id: "turn-1-failed",
+              kind: "generation",
+              label: "生成回答失败",
+              detail: "模型调用失败，请重试。",
+              status: "failed",
+              started_at_ms: turn.started_at_ms,
+              completed_at_ms: turn.completed_at_ms,
+              public_payload: {
+                result_summary: "模型调用失败，请重试。",
+                is_error: true,
+              },
+            },
+          ],
+          citations: [],
+          error: {
+            public_message: "模型调用失败，请重试。",
+            debug_message: "model call failed",
+            code: null,
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText("处理失败")).toHaveLength(2);
+    expect(screen.getAllByText("模型调用失败，请重试。")).toHaveLength(2);
+    expect(screen.getByText("生成回答失败")).toBeInTheDocument();
+    expect(screen.queryByText("正在处理")).not.toBeInTheDocument();
   });
 });

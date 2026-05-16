@@ -61,7 +61,14 @@ export function AgentTurnView({
 
           {assistantText.trim() ? (
             <MarkdownMessage content={assistantText} streaming={turn.status === "running"} />
-          ) : (
+          ) : turn.status === "failed" && turn.error?.public_message ? (
+            <div className="rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-sm leading-6 text-destructive">
+              <p className="text-[11px] font-medium">处理失败</p>
+              <p className="mt-1 break-words [overflow-wrap:anywhere]">
+                {turn.error.public_message}
+              </p>
+            </div>
+          ) : turn.status === "failed" ? null : (
             <p className="text-sm leading-6 text-muted-foreground">正在处理</p>
           )}
 

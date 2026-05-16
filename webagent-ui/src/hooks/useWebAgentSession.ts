@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentSubscriber,
   ActivityDeltaEvent,
+  ActivitySnapshotEvent,
   RunFinishedEvent,
   StateSnapshotEvent,
   TextMessageContentEvent,
@@ -92,26 +93,89 @@ function mergeById<T extends { id: string }>(current: T[], incoming: T[]): T[] {
   return next;
 }
 
-function readActivityPayload(event: ActivityDeltaEvent): {
+function mergeFailedGenerationStep({
+  message,
+  now,
+  runId,
+  steps,
+}: {
+  message: string;
+  now: number;
+  runId: string;
+  steps: AgentTurnStep[];
+}): AgentTurnStep[] {
+  return mergeById(steps, [
+    {
+      id: `${runId}-failed`,
+      kind: "generation",
+      label: "生成回答失败",
+      detail: message,
+      status: "failed",
+      started_at_ms: now,
+      completed_at_ms: now,
+      public_payload: {
+        result_summary: message,
+        is_error: true,
+      },
+    },
+  ]);
+}
+
+function failTurnWithMessage(
+  turn: AgentTurnRecord,
+  runId: string,
+  message: string,
+): AgentTurnRecord {
+  const now = Date.now();
+  return {
+    ...turn,
+    status: "failed",
+    completed_at_ms: now,
+    steps: mergeFailedGenerationStep({
+      message,
+      now,
+      runId,
+      steps: turn.steps,
+    }),
+    error: {
+      public_message: message,
+      debug_message: message,
+      code: null,
+    },
+  };
+}
+
+type ActivityPayload = {
   steps: AgentTurnStep[];
   citations: AgentCitation[];
   expertResults: AgentExpertResult[];
-} | null {
-  const delta = event.delta as
+};
+
+function readActivityContentPayload(content: unknown): ActivityPayload | null {
+  const payload = content as
     | {
         steps?: AgentTurnStep[];
         citations?: AgentCitation[];
         expertResults?: AgentExpertResult[];
       }
-    | undefined;
-  if (!delta) {
+      | undefined;
+  if (!payload) {
     return null;
   }
   return {
-    steps: Array.isArray(delta.steps) ? delta.steps : [],
-    citations: Array.isArray(delta.citations) ? delta.citations : [],
-    expertResults: Array.isArray(delta.expertResults) ? delta.expertResults : [],
+    steps: Array.isArray(payload.steps) ? payload.steps : [],
+    citations: Array.isArray(payload.citations) ? payload.citations : [],
+    expertResults: Array.isArray(payload.expertResults) ? payload.expertResults : [],
   };
+}
+
+function readActivitySnapshotPayload(event: ActivitySnapshotEvent): ActivityPayload | null {
+  return readActivityContentPayload(event.content);
+}
+
+function readActivityDeltaPayload(event: ActivityDeltaEvent): ActivityPayload | null {
+  const rawEvent = event.rawEvent as { delta?: unknown } | undefined;
+  return readActivityContentPayload(rawEvent?.delta);
 }
 
 function readTurnFromRunFinished(event: RunFinishedEvent): AgentTurnRecord | null {
@@ -298,8 +362,29 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
               status: "running",
             }));
           },
+          onActivitySnapshotEvent: ({ event }: { event: ActivitySnapshotEvent }) => {
+            const payload = readActivitySnapshotPayload(event);
+            if (!payload) {
+              return;
+            }
+            updateTurn((turn) => ({
+              ...turn,
+              steps: mergeById(turn.steps, payload.steps),
+              citations: mergeById(turn.citations, payload.citations),
+              expert_results: mergeById(
+                turn.expert_results.map((expert) => ({
+                  ...expert,
+                  id: expert.expert_name,
+                })),
+                payload.expertResults.map((expert) => ({
+                  ...expert,
+                  id: expert.expert_name,
+                })),
+              ).map(({ id: _id, ...expert }) => expert),
+            }));
+          },
           onActivityDeltaEvent: ({ event }: { event: ActivityDeltaEvent }) => {
-            const payload = readActivityPayload(event);
+            const payload = readActivityDeltaPayload(event);
             if (!payload) {
               return;
             }
@@ -348,16 +433,8 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
             }));
           },
           onRunFailed: ({ error: runError }) => {
-            updateTurn((turn) => ({
-              ...turn,
-              status: "failed",
-              completed_at_ms: Date.now(),
-              error: {
-                public_message: "处理失败",
-                debug_message: runError.message,
-                code: null,
-              },
-            }));
+            const message = toErrorMessage(runError);
+            updateTurn((turn) => failTurnWithMessage(turn, runId, message));
           },
         };
 
@@ -378,18 +455,7 @@ export function useWebAgentSession(auth: RequestAuth): UseWebAgentSessionResult 
         setError(message);
         setAgentTurns((current) =>
           current.map((turn) =>
-            turn.id === runId
-              ? {
-                  ...turn,
-                  status: "failed",
-                  completed_at_ms: Date.now(),
-                  error: {
-                    public_message: "处理失败",
-                    debug_message: message,
-                    code: null,
-                  },
-                }
-              : turn,
+            turn.id === runId ? failTurnWithMessage(turn, runId, message) : turn,
           ),
         );
         throw new Error(message);

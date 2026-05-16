@@ -325,6 +325,7 @@ export function ConversationStage({
     URL.revokeObjectURL(url);
   }, [threadTitle]);
 
+  const hasAgentTurnPath = agentTurns.length > 0;
   const connectionLabel = loading
     ? "正在同步对话..."
     : sending
@@ -333,7 +334,9 @@ export function ConversationStage({
         ? threadEventsConnected
           ? "正在生成回复，内容会持续进入时间线"
           : "正在生成回复，实时连接重试中"
-        : threadEventsConnected
+        : hasAgentTurnPath
+          ? "对话已同步，可继续提问"
+          : threadEventsConnected
           ? "对话已连接，可继续提问"
           : "对话连接中断，正在等待下一次同步";
   const showSessionControls = Boolean(onCreateDiscussion || onSelectDiscussion || discussions.length);
@@ -427,7 +430,6 @@ export function ConversationStage({
       ),
     [expertRun, expertRunEvents, messages, pendingMessages, threadSnapshot, visibleMessageLimit],
   );
-  const hasAgentTurnPath = agentTurns.length > 0;
   const groupedAgentTurns = useMemo(
     () => groupTurnsByDisplayDate(agentTurns),
     [agentTurns],
@@ -766,13 +768,6 @@ export function ConversationStage({
               ref={viewportRef}
             >
               <div className="flex min-h-full flex-col gap-4 pb-2">
-                {error ? (
-                  <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-                    <p className="text-[11px] font-medium">处理异常</p>
-                    <p className="mt-1 break-words [overflow-wrap:anywhere]">{error}</p>
-                  </div>
-                ) : null}
-
                 {groupedAgentTurns.map((group) => (
                   <section className="space-y-2" key={group.key}>
                     <div className="sticky top-0 z-10 flex justify-center py-1">
@@ -832,7 +827,10 @@ export function ConversationStage({
           >
             <div className="flex min-h-full flex-col gap-4 pb-2">
               {error ? (
-                <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                <div
+                  className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+                  data-page-error="true"
+                >
                   <p className="text-[11px] font-medium">处理异常</p>
                   <p className="mt-1 break-words [overflow-wrap:anywhere]">{error}</p>
                 </div>

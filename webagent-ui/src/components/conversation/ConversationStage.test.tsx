@@ -309,6 +309,71 @@ describe("ConversationStage", () => {
     container.remove();
   });
 
+  it("does not show legacy thread event disconnection copy on the AgentTurn path", async () => {
+    const { container, root } = await renderConversation(
+      <ConversationStage
+        agentTurns={[agentTurn()]}
+        messages={[]}
+        onSendMessage={() => {}}
+        threadEventsConnected={false}
+      />,
+    );
+
+    expect(container.textContent).toContain("AI 分析师");
+    expect(container.textContent).not.toContain("对话连接中断");
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it("keeps AgentTurn run errors inside the failed turn instead of a page error", async () => {
+    const { container, root } = await renderConversation(
+      <ConversationStage
+        agentTurns={[
+          agentTurn({
+            assistant_text: "",
+            status: "failed",
+            steps: [
+              {
+                id: "turn-1-failed",
+                kind: "generation",
+                label: "生成回答失败",
+                detail: "模型调用失败，请重试。",
+                status: "failed",
+                started_at_ms: new Date("2026-05-15T10:00:04+08:00").getTime(),
+                completed_at_ms: new Date("2026-05-15T10:00:07+08:00").getTime(),
+                public_payload: {
+                  result_summary: "模型调用失败，请重试。",
+                  is_error: true,
+                },
+              },
+            ],
+            error: {
+              public_message: "模型调用失败，请重试。",
+              debug_message: "模型调用失败，请重试。",
+              code: null,
+            },
+          }),
+        ]}
+        error="模型调用失败，请重试。"
+        isPlatformAdmin={false}
+        messages={[]}
+        onSendMessage={() => {}}
+      />,
+    );
+
+    expect(container.querySelector('[data-page-error="true"]')).toBeNull();
+    expect(container.textContent).toContain("处理失败");
+    expect(container.textContent).toContain("模型调用失败，请重试。");
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
   it("shows the submitted user message immediately while the backend request is pending", async () => {
     let resolveSend: (() => void) | null = null;
     const onSendMessage = vi.fn(
